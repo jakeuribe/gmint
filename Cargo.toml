@@ -1,0 +1,11 @@
+[package]
+name = "gmint"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Same pin as ../motherboard-server/posttrain, so the registry and build cache are shared.
+burn = { version = "=0.22.1", features = ["cuda", "flex", "autodiff"] }
+
+[profile.dev]
+opt-level = 1
