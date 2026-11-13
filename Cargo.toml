@@ -5,7 +5,11 @@ edition = "2024"
 
 [dependencies]
 # Same pin as ../motherboard-server/posttrain, so the registry and build cache are shared.
-burn = { version = "=0.22.1", features = ["cuda", "flex", "autodiff"] }
+# Without burn's default features, so without its operation fusion: nearly every op on the hot
+# path is a hand-written kernel it cannot fuse, and its bookkeeping measured 7% slower.
+burn = { version = "=0.22.1", default-features = false, features = ["std", "cuda", "flex", "autodiff", "extension"] }
+# for hand-written kernels (src/fused.rs): the device tensor type and the kernel macros
+burn-cubecl = { version = "=0.22.1", default-features = false }
 
 [profile.dev]
 opt-level = 1

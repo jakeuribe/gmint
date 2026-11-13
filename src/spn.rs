@@ -2,27 +2,29 @@
 //! log-domain arithmetic.
 //!
 //! The circuit scores the joint assignment of the 8 context bytes and the next byte; evaluating it
-//! for all 256 candidates and normalising gives the next byte's distribution, the way Liu, Mandt &
-//! Van den Broeck (2021) drive an arithmetic coder from a probabilistic circuit. Product nodes
-//! are additions of Q8 log values; sum nodes are integer log-sum-exp from the same exp table the
-//! softmax uses. The weights are unnormalised, which the final normalisation over the next byte
-//! makes harmless.
+//! for all 256 candidates gives one log score each, which [`crate::mix::Mix`] normalises into the
+//! next byte's distribution, the way Liu, Mandt & Van den Broeck (2021) drive an arithmetic coder
+//! from a probabilistic circuit. Product nodes are additions of Q8 log values; sum nodes are
+//! integer log-sum-exp from the same exp table the softmax uses. The weights are unnormalised,
+//! which the final normalisation over the next byte makes harmless.
 //!
-//! Structure, repeated in `replicas` copies that a final sum node mixes: the context positions
-//! are dealt at random into four leaf regions of two, and the next byte joins the last one. Each
-//! leaf region has `comps` factorised distributions. Regions 0 and 1 meet in sum layer A, regions
-//! 2 and 3 in sum layer B, and A and B meet at the replica's root. Only the path through region 3
-//! depends on the candidate byte, so only it carries the 256-wide dimension; the two sum layers
-//! on that path are evaluated as nested log-sum-exps to keep that tensor small.
+//! Structure, repeated in `replicas` copies that a final sum node mixes. Every context position is
+//! a leaf with `comps` distributions, and the positions are dealt at random onto the 8 leaves of a
+//! binary tree, drawn afresh per replica. Three sum layers merge the leaves pairwise (8 -> 4 -> 2
+//! -> 1), each with `comps` sum nodes over all pairs of its children's nodes. The next byte is its
+//! own leaf, joined to the context tree's root by a last sum layer, so only that layer carries
+//! the 256-wide candidate dimension.
 
 use burn::tensor::ops::IndexingUpdateOp;
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
-use crate::fixed::{Config, LOGIT_SPAN, Predictor, Rng, VOCAB, exp_lut, shr_floor, shr_round, shr_round0};
+use crate::fixed::{Config, LOGIT_SPAN, Rng, VOCAB, exp_lut, shr_floor, shr_round, shr_round0};
 use crate::optim::Optimizer;
 
-/// Context positions; the region layout below is written for exactly this many.
+/// Context positions: the leaves of a depth-3 binary tree.
 pub const CTX: usize = 8;
+/// Sum layers between the leaves and the context tree's root.
+const LEVELS: usize = 3;
 const SHADOW_MAX: i32 = (1 << 18) - 1;
 /// Extra bits of precision the backward pass carries. Errors for the 255 wrong candidates are
 /// small and must cancel the right one's across several probability multiplies; at Q12 they
@@ -34,8 +36,19 @@ const ERR_MAX: i32 = (1 << (12 + ERR_BITS)) - 1;
 pub const MAX_FAN_IN: usize = 64;
 /// Largest fan-in the log table covers: the final normalisation runs over all 256 candidates.
 const LOG_FAN_IN: usize = VOCAB;
-/// Scale of this model's gradients against the attention head's, for [`crate::optim::Rule::Sgd`].
-const SGD_OFFSET: i32 = 6;
+/// Scale of this model's gradients against the attention head's, for [`crate::optim::Rule::Sgd`];
+/// set so one `lr` suits both when they are mixed.
+const SGD_OFFSET: i32 = 14;
+/// Initial spread of the leaf log-potentials and sum weights, in Q8 logs (about 12 and 6 nats).
+/// A mixture whose components start alike never separates them: with the small spread the
+/// attention model uses, this network learned only the next byte's overall frequencies.
+/// Updates between structure adaptations, and the weight gaps they act on, as Q16 shadows:
+/// about 8 nats below a sum node's largest weight to prune, and 2 nats below it to regrow.
+const ADAPT_EVERY: u64 = 1024;
+const PRUNE_GAP: i32 = 2048 << 6;
+const REGROW_GAP: i32 = 512 << 6;
+const LEAF_SPAN: i32 = 3000;
+const WEIGHT_SPAN: i32 = 1500;
 
 /// 256 * ln(i / 256) for i in 256..=256 * LOG_FAN_IN, by inverting the integer exp table.
 fn log_lut() -> Vec<i32> {
@@ -55,89 +68,84 @@ fn log_lut() -> Vec<i32> {
 pub struct Spn {
     cfg: Config,
     /// Q16 shadows, used as `shadow >> 6` (Q8 logs, up to 16 nats either way).
-    /// `[(CTX + 1) * 256, R * I]`: leaf log-potentials by (position, byte value).
+    /// `[(CTX + 1) * 256, R * I]`: leaf log-potentials by (position, byte value); the last 256
+    /// rows are the next byte's.
     leaf: Tensor<2, Int>,
-    /// `[R * K, I * I]`: sum layer A over (region 0, region 1) pairs.
-    wa: Tensor<2, Int>,
-    /// `[R * K, I * I]`: sum layer B over (region 3, region 2) pairs.
-    wb: Tensor<2, Int>,
-    /// `[R, K * K]`: each replica's root over (B, A) pairs.
-    wroot: Tensor<2, Int>,
+    /// Per sum layer, `[N * R * K, I * I]` for its N = 4, 2, 1 nodes: weights over child pairs.
+    layers: Vec<Tensor<2, Int>>,
+    /// `[R * J, K]`: the top sum layer, over (next-byte distribution j, context root node k).
+    wtop: Tensor<2, Int>,
     /// `[1, R]`: the mix over replicas.
     wmix: Tensor<2, Int>,
-    /// Per region `[1, CTX, R, 1]`: 1 where a context position belongs to it.
-    member: Vec<Tensor<4, Int>>,
+    /// `[1, 8, CTX, R, 1]`: 1 where a context position sits on a tree leaf.
+    member: Tensor<5, Int>,
     /// `[1, CTX]`: each position's first row in `leaf`.
     row_base: Tensor<2, Int>,
     exp: Tensor<1, Int>,
     log: Tensor<1, Int>,
     opt: Optimizer,
-    pending: Option<Cache>,
+    updates: u64,
     device: Device,
 }
 
-struct Cache {
+pub struct Cache {
     idx: Tensor<1, Int>,
-    prob: Tensor<2, Int>,
     p_mix: Tensor<3, Int>,
-    p_root: Tensor<4, Int>,
-    p_root_a: Tensor<4, Int>,
-    p_a: Tensor<4, Int>,
-    p_b3: Tensor<5, Int>,
-    p_b2: Tensor<5, Int>,
+    p_top: Tensor<4, Int>,
+    p_join: Tensor<4, Int>,
+    /// Per sum layer, `[B, N, R, K, I * I]`.
+    p_layers: Vec<Tensor<5, Int>>,
 }
 
-/// The seven gradients, in the order the optimizer numbers its groups.
+/// Gradients in the order the optimizer numbers its groups: leaf, the three layers, top, mix.
 pub struct Grads {
     pub leaf: Tensor<2, Int>,
-    pub wa: Tensor<2, Int>,
-    pub wb: Tensor<2, Int>,
-    pub wroot: Tensor<2, Int>,
+    pub layers: Vec<Tensor<2, Int>>,
+    pub wtop: Tensor<2, Int>,
     pub wmix: Tensor<2, Int>,
 }
 
 impl Spn {
     pub fn new(cfg: Config, device: &Device) -> Self {
-        let (r, i) = (cfg.hid, cfg.emb);
+        let (r, i) = (cfg.replicas, cfg.comps);
         let mut rng = Rng(cfg.seed);
         let mut mk = |rows: usize, cols: usize, span: i32| -> Tensor<2, Int> {
             Tensor::from_data(TensorData::new(rng.ints(rows * cols, span << 6), [rows, cols]), device)
         };
-        let (leaf, wa, wb, wroot, wmix) =
-            (mk((CTX + 1) * VOCAB, r * i, 64), mk(r * i, i * i, 16), mk(r * i, i * i, 16), mk(r, i * i, 16), mk(1, r, 16));
-        // the random part: which context positions share a leaf region, drawn per replica
-        let mut member = vec![vec![0i32; CTX * r]; 4];
+        let leaf = mk((CTX + 1) * VOCAB, r * i, LEAF_SPAN);
+        let layers = (0..LEVELS).map(|l| mk((CTX >> (l + 1)) * r * i, i * i, WEIGHT_SPAN)).collect();
+        let (wtop, wmix) = (mk(r * i, i, WEIGHT_SPAN), mk(1, r, 16));
+        // the random part: which context position sits on which leaf of the tree, per replica
+        let mut member = vec![0i32; CTX * CTX * r];
         for rep in 0..r {
             let mut order: Vec<usize> = (0..CTX).collect();
             for at in (1..CTX).rev() {
                 order.swap(at, (rng.next() >> 33) as usize % (at + 1));
             }
-            for (slot, pos) in order.into_iter().enumerate() {
-                member[slot / 2][pos * r + rep] = 1;
+            for (leaf_at, pos) in order.into_iter().enumerate() {
+                member[(leaf_at * CTX + pos) * r + rep] = 1;
             }
         }
-        let member = member.into_iter().map(|m| Tensor::from_data(TensorData::new(m, [1, CTX, r, 1]), device)).collect();
         let bases: Vec<i32> = (0..CTX).map(|d| (d * VOCAB) as i32).collect();
         Self {
             cfg,
             leaf,
-            wa,
-            wb,
-            wroot,
+            layers,
+            wtop,
             wmix,
-            member,
+            member: Tensor::from_data(TensorData::new(member, [1, CTX, CTX, r, 1]), device),
             row_base: Tensor::from_data(TensorData::new(bases, [1, CTX]), device),
             exp: Tensor::from_data(TensorData::new(exp_lut(), [LOGIT_SPAN as usize + 1]), device),
             log: Tensor::from_data(TensorData::new(log_lut(), [256 * LOG_FAN_IN + 1]), device),
-            opt: Optimizer::new(cfg.rule, cfg.lr, 5),
-            pending: None,
+            opt: Optimizer::new(cfg.rule, cfg.lr, LEVELS + 3),
+            updates: 0,
             device: device.clone(),
         }
     }
 
-    /// Integer log-sum-exp over the last dim of Q8 logs. Returns the Q20 exp weights, the result
-    /// (last dim kept, size 1) and the Q12 softmax weights, which are its gradient.
-    fn lse<const D: usize>(&self, x: Tensor<D, Int>) -> (Tensor<D, Int>, Tensor<D, Int>, Tensor<D, Int>) {
+    /// Integer log-sum-exp over the last dim of Q8 logs. Returns the result (last dim kept, size
+    /// 1) and the Q12 softmax weights, which are its gradient.
+    fn lse<const D: usize>(&self, x: Tensor<D, Int>) -> (Tensor<D, Int>, Tensor<D, Int>) {
         let dims = x.dims();
         let top = x.clone().max_dim(D - 1);
         let d = (top.clone() - x).clamp(0, LOGIT_SPAN);
@@ -146,87 +154,79 @@ impl Spn {
         let total = e.clone().sum_dim(D - 1).bitwise_right_shift_scalar(12);
         let tdims = total.dims();
         let ln = self.log.clone().select(0, total.clone().reshape([tdims.iter().product::<usize>()])).reshape(tdims);
-        (e.clone(), top + ln, e / total)
+        (top + ln, e / total)
     }
 
-    fn forward(&self, ctx: Tensor<2, Int>) -> (Tensor<2, Int>, Cache) {
-        let (b, r, i) = (self.cfg.batch, self.cfg.hid, self.cfg.emb);
+    /// Q8 log score of every candidate next byte, `[B, 256]`.
+    pub fn scores(&self, ctx: Tensor<2, Int>) -> (Tensor<2, Int>, Cache) {
+        let (b, r, i) = (self.cfg.batch, self.cfg.replicas, self.cfg.comps);
         let w = |t: &Tensor<2, Int>| shr_floor(t.clone(), 6);
         let leaf = w(&self.leaf);
 
-        // leaf regions: each sums its positions' log-potentials, [B, R, I]
+        // tree leaves: each takes the log-potentials of the position dealt to it, [B, 8, R, I]
         let idx = (ctx + self.row_base.clone()).reshape([b * CTX]);
-        let f = leaf.clone().select(0, idx.clone()).reshape([b, CTX, r, i]);
-        let region = |l: usize| (f.clone() * self.member[l].clone()).sum_dim(1).reshape([b, r, i]);
-        let (l0, l1, l2, l3) = (region(0), region(1), region(2), region(3));
-        // region 3 also holds the next byte: one row per candidate, [B, 256, R, I]
-        let l3 = l3.reshape([b, 1, r, i]) + leaf.narrow(0, CTX * VOCAB, VOCAB).reshape([1, VOCAB, r, i]);
+        let f = leaf.clone().select(0, idx.clone()).reshape([b, 1, CTX, r, i]);
+        let mut x = (f * self.member.clone()).sum_dim(2).reshape([b, CTX, r, i]);
 
-        // sum layer A over all (i, j) pairs of regions 0 and 1: [B, R, K, I*I] -> [B, R, K]
-        let pairs = (l0.reshape([b, r, i, 1]) + l1.reshape([b, r, 1, i])).reshape([b, r, 1, i * i]);
-        let (_, a, p_a) = self.lse(pairs + w(&self.wa).reshape([1, r, i, i * i]));
+        // sum layers: node n merges children 2n and 2n+1 over all (i, j) pairs of their nodes
+        let mut p_layers = Vec::with_capacity(LEVELS);
+        for weights in &self.layers {
+            let n = x.dims()[1] / 2;
+            let kids = x.reshape([b, n, 2, r, i]);
+            let (left, right) = (kids.clone().narrow(2, 0, 1), kids.narrow(2, 1, 1));
+            let pairs = (left.reshape([b, n, r, i, 1]) + right.reshape([b, n, r, 1, i])).reshape([b, n, r, 1, i * i]);
+            let (out, p) = self.lse(pairs + w(weights).reshape([1, n, r, i, i * i]));
+            p_layers.push(p);
+            x = out.reshape([b, n, r, i]);
+        }
 
-        // sum layer B = lse over (j, i) of wb + l3_j + l2_i, nested: the inner lse over region 2
-        // is narrow, and only the outer one over region 3 carries the candidates
-        let (_, inner, p_b2) = self.lse(w(&self.wb).reshape([1, r, i, i, i]) + l2.reshape([b, r, 1, 1, i]));
-        let (_, bsum, p_b3) = self.lse(l3.reshape([b, VOCAB, r, 1, i]) + inner.reshape([b, 1, r, i, i]));
+        // top layer = lse over (j, k) of wtop + next_j(candidate) + root_k, nested so that only
+        // the outer lse over j carries the candidates
+        let (join, p_join) = self.lse(w(&self.wtop).reshape([1, r, i, i]) + x.reshape([b, r, 1, i]));
+        let next = leaf.narrow(0, CTX * VOCAB, VOCAB).reshape([1, VOCAB, r, i]);
+        let (score, p_top) = self.lse(next + join.reshape([b, 1, r, i]));
 
-        // root = lse over (c, a) of wroot + B_c + A_a, nested the same way
-        let (_, via_a, p_root_a) = self.lse(w(&self.wroot).reshape([1, r, i, i]) + a.reshape([b, r, 1, i]));
-        let (_, root, p_root) = self.lse(bsum.reshape([b, VOCAB, r, i]) + via_a.reshape([b, 1, r, i]));
-
-        // mix the replicas, then normalise over the candidates
-        let (_, logit, p_mix) = self.lse(root.reshape([b, VOCAB, r]) + w(&self.wmix).reshape([1, 1, r]));
-        let (e, _, prob) = self.lse(logit.reshape([b, VOCAB]));
-        (e, Cache { idx, prob, p_mix, p_root, p_root_a, p_a, p_b3, p_b2 })
+        // mix the replicas
+        let (logit, p_mix) = self.lse(score.reshape([b, VOCAB, r]) + w(&self.wmix).reshape([1, 1, r]));
+        (logit.reshape([b, VOCAB]), Cache { idx, p_mix, p_top, p_join, p_layers })
     }
 
-    /// Gradients of the summed code length, averaged down to a per-128-rows scale.
-    fn grads(&self, c: &Cache, target: Tensor<1, Int>) -> Grads {
-        let (b, r, i) = (self.cfg.batch, self.cfg.hid, self.cfg.emb);
+    /// Gradients from the error at the scores (`g`, Q12, `|g| <= 2^12`), averaged down to a
+    /// per-128-rows scale.
+    fn grads(&self, c: &Cache, g: Tensor<2, Int>) -> Grads {
+        let (b, r, i) = (self.cfg.batch, self.cfg.replicas, self.cfg.comps);
         let scale = (b / 128).trailing_zeros() + ERR_BITS;
-        let narrow = |t: Tensor<4, Int>| t.clamp(-ERR_MAX, ERR_MAX);
-
         // |g| <= 2^17; every product below is an error (<= 2^17) times a Q12 weight. The shifts
         // round to nearest: a floor's half-unit bias would be summed over 256 candidates and
-        // swamp the small errors.
-        let g = (c.prob.clone() - target.one_hot::<2>(VOCAB) * 4096) * (1 << ERR_BITS);
-        let d_root = shr_round(g.reshape([b, VOCAB, 1]) * c.p_mix.clone(), 12);
-        // summed over candidates (clamped back to 2^17), then rows: 2^17 * B <= 2^26
-        let d_wmix = d_root.clone().sum_dim(1).clamp(-ERR_MAX, ERR_MAX).sum_dim(0).reshape([1, r]);
+        // swamp the small errors. Sums over a batch of 512 stay under 2^27.
+        let g = g * (1 << ERR_BITS);
+        let d_score = shr_round(g.reshape([b, VOCAB, 1]) * c.p_mix.clone(), 12);
+        let d_wmix = d_score.clone().sum_dim(1).clamp(-ERR_MAX, ERR_MAX).sum_dim(0).reshape([1, r]);
 
-        // root: outer lse over c carries the candidates, inner lse over a does not
-        let d_b = shr_round(d_root.reshape([b, VOCAB, r, 1]) * c.p_root.clone(), 12);
-        let d_via = narrow(d_b.clone().sum_dim(1).reshape([b, r, i, 1]));
-        let t_root = shr_round(d_via * c.p_root_a.clone(), 12);
-        let d_wroot = t_root.clone().sum_dim(0).reshape([r, i * i]);
-        let d_a = narrow(t_root.sum_dim(2).reshape([b, r, i, 1]));
+        // top layer: the next byte's leaf takes the error per candidate; the context side takes
+        // it summed over candidates
+        let t_top = shr_round(d_score.reshape([b, VOCAB, r, 1]) * c.p_top.clone(), 12);
+        let d_next = t_top.clone().sum_dim(0).reshape([VOCAB, r * i]);
+        let d_join = t_top.sum_dim(1).reshape([b, r, i, 1]).clamp(-ERR_MAX, ERR_MAX);
+        let t_join = shr_round(d_join * c.p_join.clone(), 12);
+        let d_wtop = t_join.clone().sum_dim(0).reshape([r * i, i]);
+        let mut d_x = t_join.sum_dim(2).reshape([b, 1, r, i]).clamp(-ERR_MAX, ERR_MAX);
 
-        // sum layer A
-        let t_a = shr_round(d_a * c.p_a.clone(), 12);
-        let d_wa = t_a.clone().sum_dim(0).reshape([r * i, i * i]);
-        let t_a = t_a.sum_dim(2).reshape([b, r, i, i]);
-        let d_l0 = narrow(t_a.clone().sum_dim(3).reshape([b, 1, r, i]));
-        let d_l1 = narrow(t_a.sum_dim(2).reshape([b, 1, r, i]));
+        // sum layers, root to leaves
+        let mut d_layers = Vec::with_capacity(LEVELS);
+        for p in c.p_layers.iter().rev() {
+            let n = d_x.dims()[1];
+            let t = shr_round(d_x.reshape([b, n, r, i, 1]) * p.clone(), 12);
+            d_layers.push(t.clone().sum_dim(0).reshape([n * r * i, i * i]));
+            let t = t.sum_dim(3).reshape([b, n, r, i, i]);
+            let left = t.clone().sum_dim(4).reshape([b, n, r, i]);
+            let right = t.sum_dim(3).reshape([b, n, r, i]);
+            d_x = Tensor::stack::<5>(vec![left, right], 2).reshape([b, 2 * n, r, i]).clamp(-ERR_MAX, ERR_MAX);
+        }
+        d_layers.reverse();
 
-        // sum layer B: outer over region 3 (with candidates), inner over region 2
-        let t_b3 = shr_round(d_b.reshape([b, VOCAB, r, i, 1]) * c.p_b3.clone(), 12);
-        let d_l3 = t_b3.clone().sum_dim(3).reshape([b, VOCAB, r, i]);
-        let d_inner = t_b3.sum_dim(1).reshape([b, r, i, i, 1]).clamp(-ERR_MAX, ERR_MAX);
-        let t_b2 = shr_round(d_inner * c.p_b2.clone(), 12);
-        let d_wb = t_b2.clone().sum_dim(0).reshape([r * i, i * i]);
-        let d_l2 = narrow(t_b2.sum_dim(2).sum_dim(3).reshape([b, 1, r, i]));
-
-        // leaves: the next byte's rows take region 3's error per candidate; each context position
-        // takes the error of the region it sits in
-        let d_next = d_l3.clone().sum_dim(0).reshape([VOCAB, r * i]);
-        let d_l3 = narrow(d_l3.sum_dim(1).reshape([b, 1, r, i]));
-        let d_f = [d_l0, d_l1, d_l2, d_l3]
-            .into_iter()
-            .zip(&self.member)
-            .map(|(d, m)| d * m.clone())
-            .reduce(|x, y| x + y)
-            .unwrap();
+        // leaves: each context position takes the error of the tree leaf it was dealt to
+        let d_f = (d_x.reshape([b, CTX, 1, r, i]) * self.member.clone().swap_dims(1, 2)).sum_dim(1);
         let d_ctx = Tensor::<2, Int>::zeros([CTX * VOCAB, r * i], &self.device).select_assign(
             0,
             c.idx.clone(),
@@ -235,9 +235,8 @@ impl Spn {
         );
         Grads {
             leaf: shr_round0(Tensor::cat(vec![d_ctx, d_next], 0), scale),
-            wa: shr_round0(d_wa, scale),
-            wb: shr_round0(d_wb, scale),
-            wroot: shr_round0(d_wroot, scale),
+            layers: d_layers.into_iter().map(|d| shr_round0(d, scale)).collect(),
+            wtop: shr_round0(d_wtop, scale),
             wmix: shr_round0(d_wmix, scale),
         }
     }
@@ -246,27 +245,40 @@ impl Spn {
         let o = &mut self.opt;
         o.tick();
         self.leaf = o.step(0, &self.leaf, g.leaf, SGD_OFFSET, SHADOW_MAX);
-        self.wa = o.step(1, &self.wa, g.wa, SGD_OFFSET, SHADOW_MAX);
-        self.wb = o.step(2, &self.wb, g.wb, SGD_OFFSET, SHADOW_MAX);
-        self.wroot = o.step(3, &self.wroot, g.wroot, SGD_OFFSET, SHADOW_MAX);
-        self.wmix = o.step(4, &self.wmix, g.wmix, SGD_OFFSET, SHADOW_MAX);
-    }
-}
-
-impl Predictor for Spn {
-    fn predict(&mut self, ctx: Tensor<2, Int>, _guess: Tensor<2, Int>) -> Vec<i32> {
-        let (e, cache) = self.forward(ctx);
-        self.pending = Some(cache);
-        (e.bitwise_right_shift_scalar(4) + 1).into_data().convert::<i32>().try_to_vec().unwrap()
+        for (l, d) in g.layers.into_iter().enumerate() {
+            self.layers[l] = o.step(1 + l, &self.layers[l], d, SGD_OFFSET, SHADOW_MAX);
+        }
+        self.wtop = o.step(LEVELS + 1, &self.wtop, g.wtop, SGD_OFFSET, SHADOW_MAX);
+        self.wmix = o.step(LEVELS + 2, &self.wmix, g.wmix, SGD_OFFSET, SHADOW_MAX);
     }
 
-    fn learn(&mut self, target: Tensor<1, Int>) {
-        let cache = self.pending.take().expect("learn without a preceding predict");
-        let g = self.grads(&cache, target);
-        self.apply(g);
+    /// Trains on the error at the scores of a pass made by [`Self::scores`].
+    pub fn learn_from(&mut self, c: &Cache, g: Tensor<2, Int>) {
+        let grads = self.grads(c, g);
+        self.apply(grads);
+        self.updates += 1;
+        if self.cfg.adapt > 0 && self.updates % ADAPT_EVERY == 0 {
+            self.adapt();
+        }
     }
 
-    fn observe(&mut self, cost_q8: u64) {
+    /// Structure adaptation, from the integer weights alone so a decoder repeats it. In every sum
+    /// node, a child whose weight has fallen [`PRUNE_GAP`] below the node's largest is pruned:
+    /// pinned to the floor, where it contributes nothing. With regrowth on, it is instead
+    /// restarted [`REGROW_GAP`] below the largest, giving the node a fresh child to specialise.
+    fn adapt(&mut self) {
+        let regrow = self.cfg.adapt == 2;
+        let fix = |w: &Tensor<2, Int>| -> Tensor<2, Int> {
+            let top = w.clone().max_dim(1);
+            let weak = (top.clone() - w.clone()).greater_elem(PRUNE_GAP).int();
+            let to = if regrow { top - REGROW_GAP } else { top * 0 - SHADOW_MAX };
+            w.clone() * (weak.clone() * -1 + 1) + weak * to
+        };
+        self.layers = self.layers.iter().map(&fix).collect();
+        self.wtop = fix(&self.wtop);
+    }
+
+    pub fn observe(&mut self, cost_q8: u64) {
         self.opt.observe(cost_q8, 8 * 256 * self.cfg.batch as u64);
     }
 }
@@ -274,25 +286,37 @@ impl Predictor for Spn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixed::{Arch, Head};
+    use crate::fixed::{Arch, Head, softmax_q12, test_device};
     use crate::optim::Rule;
     use burn::tensor::activation::log_softmax;
 
     const CFG: Config = Config {
         arch: Arch::Spn,
         ctx: CTX,
-        emb: 4,
-        hid: 3,
+        emb: 32,
+        hid: 256,
         batch: 128,
-        lr: 12,
+        lr: 20,
         rule: Rule::Sgd,
         head: Head::Softmax,
         matcher: false,
+        comps: 4,
+        replicas: 3,
+        short: 0,
+        adapt: 0,
+        warm: 0,
+        norm: false,
         seed: 7,
     };
 
-    fn ints(t: &Tensor<2, Int>) -> Vec<i32> {
+    fn ints<const D: usize>(t: &Tensor<D, Int>) -> Vec<i32> {
         t.clone().into_data().convert::<i32>().try_to_vec().unwrap()
+    }
+
+    /// The error at the scores for a batch, as [`crate::mix::Mix`] forms it: Q12 and zero-sum.
+    fn error(model: &Spn, scores: Tensor<2, Int>, tgt: Tensor<1, Int>) -> Tensor<2, Int> {
+        let p = softmax_q12(&model.exp, scores).1;
+        p.clone() - tgt.one_hot::<2>(VOCAB) * p.sum_dim(1)
     }
 
     fn batch(rng: &mut Rng, device: &Device) -> (Tensor<2, Int>, Tensor<1, Int>) {
@@ -307,22 +331,22 @@ mod tests {
     /// The handwritten integer backward pass against float autodiff on the same circuit.
     #[test]
     fn integer_gradients_follow_autodiff() {
-        let device = Device::flex();
+        let device = test_device();
         let mut rng = Rng(21);
         let mut model = Spn::new(CFG, &device);
         for _ in 0..30 {
             let (ctx, tgt) = batch(&mut rng, &device);
-            let (_, c) = model.forward(ctx);
-            let g = model.grads(&c, tgt);
-            model.apply(g);
+            let (scores, c) = model.scores(ctx);
+            let g = error(&model, scores, tgt);
+            model.learn_from(&c, g);
         }
         let (ctx, tgt) = batch(&mut rng, &device);
-        let (_, cache) = model.forward(ctx.clone());
-        let got = model.grads(&cache, tgt.clone());
+        let (scores, cache) = model.scores(ctx.clone());
+        let got = model.grads(&cache, error(&model, scores, tgt.clone()));
 
         // float twin on the forward (Q8 log) weights; lse(x) = 256 * logsumexp(x / 256)
         let ad = device.clone().autodiff();
-        let (b, r, i) = (CFG.batch, CFG.hid, CFG.emb);
+        let (b, r, i) = (CFG.batch, CFG.replicas, CFG.comps);
         let leaf_of = |s: &Tensor<2, Int>| -> Tensor<2> {
             let v: Vec<f32> = ints(&shr_floor(s.clone(), 6)).iter().map(|x| *x as f32).collect();
             Tensor::<2>::from_data(TensorData::new(v, s.dims()), &ad).require_grad()
@@ -331,32 +355,37 @@ mod tests {
             let top = x.clone().max_dim(D - 1).detach();
             ((x - top.clone()) / 256.0).exp().sum_dim(D - 1).log() * 256.0 + top
         }
-        let (leaf, wa, wb, wroot, wmix) =
-            (leaf_of(&model.leaf), leaf_of(&model.wa), leaf_of(&model.wb), leaf_of(&model.wroot), leaf_of(&model.wmix));
-        let member = |l: usize| -> Tensor<4> {
-            let v: Vec<f32> = model.member[l].clone().into_data().convert::<i32>().try_to_vec::<i32>().unwrap().iter().map(|x| *x as f32).collect();
-            Tensor::<4>::from_data(TensorData::new(v, [1, CTX, r, 1]), &ad)
-        };
+        let leaf = leaf_of(&model.leaf);
+        let layers: Vec<Tensor<2>> = model.layers.iter().map(&leaf_of).collect();
+        let (wtop, wmix) = (leaf_of(&model.wtop), leaf_of(&model.wmix));
+        let member: Vec<f32> = ints(&model.member).iter().map(|x| *x as f32).collect();
+        let member = Tensor::<5>::from_data(TensorData::new(member, [1, CTX, CTX, r, 1]), &ad);
         let idx = Tensor::<1, Int>::from_data(cache.idx.clone().into_data(), &ad);
-        let f = leaf.clone().select(0, idx).reshape([b, CTX, r, i]);
-        let region = |l: usize| (f.clone() * member(l)).sum_dim(1).reshape([b, r, i]);
-        let (l0, l1, l2, l3) = (region(0), region(1), region(2), region(3));
-        let l3 = l3.reshape([b, 1, r, i]) + leaf.clone().narrow(0, CTX * VOCAB, VOCAB).reshape([1, VOCAB, r, i]);
-        let pairs = (l0.reshape([b, r, i, 1]) + l1.reshape([b, r, 1, i])).reshape([b, r, 1, i * i]);
-        let a = lse(pairs + wa.clone().reshape([1, r, i, i * i]));
-        let inner = lse(wb.clone().reshape([1, r, i, i, i]) + l2.reshape([b, r, 1, 1, i]));
-        let bsum = lse(l3.reshape([b, VOCAB, r, 1, i]) + inner.reshape([b, 1, r, i, i]));
-        let via_a = lse(wroot.clone().reshape([1, r, i, i]) + a.reshape([b, r, 1, i]));
-        let root = lse(bsum.reshape([b, VOCAB, r, i]) + via_a.reshape([b, 1, r, i]));
-        let logit = lse(root.reshape([b, VOCAB, r]) + wmix.clone().reshape([1, 1, r])).reshape([b, VOCAB]);
+        let f = leaf.clone().select(0, idx).reshape([b, 1, CTX, r, i]);
+        let mut x = (f * member).sum_dim(2).reshape([b, CTX, r, i]);
+        for weights in &layers {
+            let n = x.dims()[1] / 2;
+            let kids = x.reshape([b, n, 2, r, i]);
+            let (left, right) = (kids.clone().narrow(2, 0, 1), kids.narrow(2, 1, 1));
+            let pairs = (left.reshape([b, n, r, i, 1]) + right.reshape([b, n, r, 1, i])).reshape([b, n, r, 1, i * i]);
+            x = lse(pairs + weights.clone().reshape([1, n, r, i, i * i])).reshape([b, n, r, i]);
+        }
+        let join = lse(wtop.clone().reshape([1, r, i, i]) + x.reshape([b, r, 1, i]));
+        let next = leaf.clone().narrow(0, CTX * VOCAB, VOCAB).reshape([1, VOCAB, r, i]);
+        let score = lse(next + join.reshape([b, 1, r, i]));
+        let logit = lse(score.reshape([b, VOCAB, r]) + wmix.clone().reshape([1, 1, r])).reshape([b, VOCAB]);
         let tgt_ad = Tensor::<1, Int>::from_data(tgt.into_data(), &ad);
         let loss = -log_softmax(logit / 256.0, 1).gather(1, tgt_ad.reshape([b, 1])).sum();
         let grads = loss.backward();
 
-        let names = ["leaf", "wa", "wb", "wroot", "wmix"];
+        let mut pairs = vec![("leaf".to_string(), leaf, &got.leaf)];
+        for (l, (w, d)) in layers.into_iter().zip(&got.layers).enumerate() {
+            pairs.push((format!("layer {l}"), w, d));
+        }
+        pairs.push(("top".to_string(), wtop, &got.wtop));
+        pairs.push(("mix".to_string(), wmix, &got.wmix));
         let mut worst = 1.0f64;
-        let got = [&got.leaf, &got.wa, &got.wb, &got.wroot, &got.wmix];
-        for ((name, want), got) in names.iter().zip([leaf, wa, wb, wroot, wmix]).zip(got) {
+        for (name, want, got) in pairs {
             let want: Vec<f32> = want.grad(&grads).unwrap().into_data().convert::<f32>().try_to_vec().unwrap();
             let got: Vec<f64> = ints(got).iter().map(|x| *x as f64).collect();
             let dot: f64 = want.iter().zip(&got).map(|(a, b)| *a as f64 * b).sum();

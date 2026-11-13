@@ -11,9 +11,9 @@
 //! Clamps on q/k/v, the residual and the error signals are passed through as identity in the
 //! backward pass.
 
-use burn::tensor::ops::IndexingUpdateOp;
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
+use crate::fused::{self, Mat, UNBOUNDED};
 use crate::optim::{Optimizer, Rule};
 
 pub const VOCAB: usize = 256;
@@ -27,7 +27,26 @@ const SHADOW_MAX: i32 = (1 << 18) - 1;
 /// Shadow bound for embeddings, whose forward value stays within +-128.
 const SHADOW_EMB_MAX: i32 = (1 << 15) - 1;
 pub const LOGIT_SPAN: i32 = 4095;
+/// Normalised hidden layer: pre-activations are cut to this before the gain is applied, and the
+/// gain (Q8) stays in `NORM_GAIN_MIN..=NORM_GAIN_MAX`, so their product stays under 2^29.
+const NORM_IN: i32 = 1 << 17;
+const NORM_GAIN_MIN: i32 = 16;
+const NORM_GAIN_MAX: i32 = 4096;
+/// Spread (mean absolute deviation, Q8) each unit's pre-activation is scaled to. 2.0 measured
+/// best on KiCad against 0.5, 1.0, 3.0, 4.0 and 8.0.
+const NORM_SPREAD: i32 = 512;
+/// log2 of the number of steps the running statistics average over.
+const NORM_EMA: u32 = 4;
 const LUT_ONE: i64 = 1 << 20;
+/// log2 of how much smaller each weight group's gradient scale is than the head's, measured
+/// against autodiff in the tests; the copy gain's input is a bare 1 where the head's inputs are
+/// Q8 activations.
+const SGD_EMB: i32 = 11;
+const SGD_VALUE: i32 = 3;
+const SGD_QUERY_KEY: i32 = 1;
+const SGD_COPY: i32 = 6;
+/// The offsets in the optimizer's group order: emb, pos, wq, wk, wv, w1, w2, copy.
+const GROUP_OFFSETS: [i32; 8] = [SGD_EMB, SGD_EMB, SGD_QUERY_KEY, SGD_QUERY_KEY, SGD_VALUE, 0, 0, SGD_COPY];
 /// round(2^32 * exp(-1/256)): one Q8 logit step, as a Q32 multiplier.
 const EXP_STEP_Q32: i64 = 4_278_222_805;
 
@@ -56,6 +75,77 @@ pub fn exp_lut() -> Vec<i32> {
     v
 }
 
+/// Backend the tests run on: the CPU one unless `GMINT_TEST_DEVICE=cuda`. On CUDA the test also
+/// takes the GPU for itself until its thread ends: the encoder records CUDA graphs, and a graph
+/// recording is broken by any CUDA call from another thread of the process meanwhile.
+#[cfg(test)]
+pub fn test_device() -> Device {
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    thread_local! {
+        static HELD: std::cell::RefCell<Option<std::sync::MutexGuard<'static, ()>>> = const { std::cell::RefCell::new(None) };
+    }
+    let mut d = match std::env::var("GMINT_TEST_DEVICE").as_deref() {
+        Ok("cuda") => {
+            HELD.with(|h| {
+                let mut h = h.borrow_mut();
+                if h.is_none() {
+                    *h = Some(GPU.lock().unwrap_or_else(|e| e.into_inner()));
+                }
+            });
+            Device::cuda(0)
+        }
+        _ => Device::flex(),
+    };
+    let _ = d.configure(burn::tensor::IntDType::I32);
+    d
+}
+
+/// `[VOCAB, VOCAB]`: row `v` is 1 at the byte values below `v`. Selecting rows by the true bytes
+/// masks the frequencies that precede them.
+pub fn below_table(device: &Device) -> Tensor<2, Int> {
+    let v: Vec<i32> = (0..VOCAB * VOCAB).map(|i| ((i % VOCAB) < (i / VOCAB)) as i32).collect();
+    Tensor::from_data(TensorData::new(v, [VOCAB, VOCAB]), device)
+}
+
+/// One-hot rows by table lookup: `one_hot` is about 70 times slower than a row select on CUDA
+/// (burn 0.22.1), and a step needs several.
+pub fn one_hot_rows(n: usize, device: &Device) -> Tensor<2, Int> {
+    let v: Vec<i32> = (0..n * n).map(|i| (i % n == i / n) as i32).collect();
+    Tensor::from_data(TensorData::new(v, [n, n]), device)
+}
+
+/// From Q20 byte weights `[B, VOCAB]` and the true bytes: (cumulative frequency below the byte,
+/// its frequency, row total) as `[B, 3]`, in the coder's frequencies (`weight >> 4`, plus 1).
+pub fn coded(e: Tensor<2, Int>, target: Tensor<1, Int>, below: &Tensor<2, Int>) -> Tensor<2, Int> {
+    let [b, _] = e.dims();
+    if fused::on_gpu(&e) {
+        return fused::coded(e, target);
+    }
+    // each frequency is at most 2^16 + 1, so a row sums to under 2^25
+    let f = e.bitwise_right_shift_scalar(4) + 1;
+    let cum = (f.clone() * below.clone().select(0, target.clone())).sum_dim(1);
+    let own = f.clone().gather(1, target.reshape([b, 1]));
+    Tensor::cat(vec![cum, own, f.sum_dim(1)], 1)
+}
+
+/// Temporary A/B switch while the leaky activation is being evaluated.
+fn leaky() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GMINT_LEAKY").is_some())
+}
+
+/// Integer softmax over the last dim of Q8 logits, given the [`exp_lut`] table as a tensor:
+/// returns (Q20 weights, Q12 probabilities).
+pub fn softmax_q12<const D: usize>(lut: &Tensor<1, Int>, logits: Tensor<D, Int>) -> (Tensor<D, Int>, Tensor<D, Int>) {
+    let dims = logits.dims();
+    let n: usize = dims.iter().product();
+    let d = (logits.clone().max_dim(D - 1) - logits).clamp(0, LOGIT_SPAN);
+    let e = lut.clone().select(0, d.reshape([n])).reshape(dims);
+    // sum(e) is in [2^20, 2^28]; it is non-negative, so the raw shift is safe
+    let p = e.clone() / e.clone().sum_dim(D - 1).bitwise_right_shift_scalar(12);
+    (e, p)
+}
+
 /// Floor division by 2^s for |t| < 2^30.
 ///
 /// burn's `bitwise_right_shift_scalar` on a negative i32 is arithmetic on the CPU backend and
@@ -71,17 +161,15 @@ pub fn shr_floor<const D: usize>(t: Tensor<D, Int>, s: u32) -> Tensor<D, Int> {
 
 /// Division by 2^s rounded to nearest, so negative updates are not biased toward -1.
 pub fn shr_round<const D: usize>(t: Tensor<D, Int>, s: u32) -> Tensor<D, Int> {
-    shr_floor(t + (1i32 << (s - 1)), s)
+    // [`shr_floor`] of `t + half`, with the two additions folded into one: every tensor op costs
+    // about the same few microseconds whatever it does, so the count is what matters
+    const BIAS_LOG2: u32 = 30;
+    (t + ((1i32 << BIAS_LOG2) + (1i32 << (s - 1)))).bitwise_right_shift_scalar(s as i32) - (1i32 << (BIAS_LOG2 - s))
 }
 
-/// `x^T @ y` summed over rows in chunks of [`CHUNK`], then averaged over the chunks, so the
-/// result is on a per-128-rows scale whatever the row count. Each chunk sum must fit in 2^30.
+/// `x^T @ y` in chunks of [`CHUNK`] rows; see [`fused::chunked_xty`].
 fn xty(x: Tensor<2, Int>, y: Tensor<2, Int>) -> Tensor<2, Int> {
-    let ([n, a], [_, b]) = (x.dims(), y.dims());
-    let chunks = n / CHUNK;
-    debug_assert!(n % CHUNK == 0 && chunks.is_power_of_two());
-    let per = x.reshape([chunks, CHUNK, a]).transpose().matmul(y.reshape([chunks, CHUNK, b]));
-    shr_floor(per, chunks.trailing_zeros()).sum_dim(0).reshape([a, b])
+    fused::chunked_xty(x, y, CHUNK)
 }
 
 /// What the codec needs from a model. Implement this to try a different predictor.
@@ -93,8 +181,38 @@ pub trait Predictor {
     fn predict(&mut self, ctx: Tensor<2, Int>, guess: Tensor<2, Int>) -> Vec<i32>;
     /// Train on the batch just predicted, given its true bytes.
     fn learn(&mut self, target: Tensor<1, Int>);
+    /// What the encoder needs and nothing more: for every stream the cumulative frequency below
+    /// the true byte, that byte's frequency, and the row total, `[batch, 3]`, left on the device.
+    /// The encoder knows the bytes in advance, so it can run many steps and read these back in
+    /// one go. The default goes through [`Self::predict`], which reads all 256 frequencies back.
+    fn predict_coded(&mut self, ctx: Tensor<2, Int>, guess: Tensor<2, Int>, target: Tensor<1, Int>) -> Tensor<2, Int> {
+        let device = target.device();
+        let syms: Vec<i32> = target.into_data().convert::<i32>().try_to_vec().unwrap();
+        let freqs = self.predict(ctx, guess);
+        let mut out = Vec::with_capacity(syms.len() * 3);
+        for (row, sym) in freqs.chunks_exact(VOCAB).zip(&syms) {
+            let cum: i32 = row[..*sym as usize].iter().sum();
+            out.extend([cum, row[*sym as usize], cum + row[*sym as usize..].iter().sum::<i32>()]);
+        }
+        Tensor::from_data(TensorData::new(out, [syms.len(), 3]), &device)
+    }
     /// Told the Q8 code length of every step, trained on or not, so a model can steer itself.
+    /// Called after [`Self::learn`] for the same step, so a change takes effect from the next one.
     fn observe(&mut self, _cost_q8: u64) {}
+    /// One line on how much of the model can still learn (see [`Model::health`]); empty when the
+    /// predictor has nothing to report. Reads tensors back, so it is not for every step.
+    fn health(&self) -> String {
+        String::new()
+    }
+    /// Whether a run of steps can be captured as a CUDA graph and replayed: every step's work is
+    /// on the GPU, and every piece of state a step changes is changed in place, so a replay
+    /// carries it forward. See [`crate::codec`].
+    fn graphable(&self) -> bool {
+        false
+    }
+    /// Brings the device copies of the optimizers' steps up to date; a replayed step does not
+    /// run the code that would.
+    fn refresh_steps(&mut self) {}
 }
 
 /// Which predictor codes the file.
@@ -102,9 +220,10 @@ pub trait Predictor {
 pub enum Arch {
     /// One attention layer and a two-layer head ([`Model`]).
     Attn,
-    /// A random sum-product network ([`crate::spn::Spn`]). `emb` is the number of distributions
-    /// per region and sum nodes per layer, `hid` the number of random replicas.
+    /// A random sum-product network ([`crate::spn::Spn`]).
     Spn,
+    /// Both, with their scores for each candidate byte added before the softmax.
+    Both,
 }
 
 impl Arch {
@@ -112,12 +231,13 @@ impl Arch {
         self as u8
     }
     pub fn from_id(id: u8) -> Option<Self> {
-        [Self::Attn, Self::Spn].into_iter().find(|a| a.id() == id)
+        [Self::Attn, Self::Spn, Self::Both].into_iter().find(|a| a.id() == id)
     }
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "attn" => Some(Self::Attn),
             "spn" => Some(Self::Spn),
+            "both" => Some(Self::Both),
             _ => None,
         }
     }
@@ -170,6 +290,17 @@ struct Tree {
     bit_q12: Tensor<2, Int>,
     /// sigma(-d/256) in Q12 for d in 0..=LOGIT_SPAN.
     sigmoid: Tensor<1, Int>,
+    /// `[VOCAB, 255]`: 1 where the byte lies in a node's 1-branch subtree.
+    right: Tensor<2, Int>,
+    /// `[255, VOCAB]`: 1 where the byte lies in the node's 1-branch (0-branch) subtree.
+    right_t: Tensor<2, Int>,
+    left_t: Tensor<2, Int>,
+    /// 256 * ln(p / 4096) for a Q12 probability p in 0..=4096.
+    logp: Tensor<1, Int>,
+    /// Leaf position of every byte value, `[VOCAB]`, from which a kernel derives the path.
+    leaf: Tensor<1, Int>,
+    /// The byte value at every leaf position, `[VOCAB]`: the inverse of `leaf`.
+    byte_at: Tensor<1, Int>,
 }
 
 impl Tree {
@@ -198,6 +329,19 @@ impl Tree {
             node.push(Tensor::from_data(TensorData::new(ids, [VOCAB]), device));
         }
         let table = |v: Vec<i32>| Tensor::<2, Int>::from_data(TensorData::new(v, [VOCAB, VOCAB - 1]), device);
+        let right: Vec<i32> = bit_q12.iter().map(|b| b / 4096).collect();
+        let left: Vec<i32> = on_path.iter().zip(&right).map(|(on, r)| on - r).collect();
+        let (right_t, left_t) = (table(right.clone()).transpose(), table(left).transpose());
+        // ln by inverting the exp table: the smallest d with exp(-d/256) <= p / 4096
+        let exp = exp_lut();
+        let mut logp = vec![-LOGIT_SPAN; 4097];
+        let mut d = LOGIT_SPAN as usize;
+        for p in 1..=4096usize {
+            while d > 0 && (exp[d - 1] as i64) <= (p as i64) << 8 {
+                d -= 1;
+            }
+            logp[p] = -(d as i32);
+        }
         // sigma(-x) = e^-x / (1 + e^-x), from the same integer exp table as the softmax
         let sigmoid: Vec<i32> = exp_lut().iter().map(|e| ((*e as i64 * 4096) / (LUT_ONE + *e as i64)) as i32).collect();
         Self {
@@ -207,6 +351,18 @@ impl Tree {
             on_path: table(on_path),
             bit_q12: table(bit_q12),
             sigmoid: Tensor::from_data(TensorData::new(sigmoid, [LOGIT_SPAN as usize + 1]), device),
+            right: table(right),
+            right_t,
+            left_t,
+            logp: Tensor::from_data(TensorData::new(logp, [4097]), device),
+            leaf: Tensor::from_data(TensorData::new(leaf.iter().map(|p| *p as i32).collect::<Vec<i32>>(), [VOCAB]), device),
+            byte_at: {
+                let mut at = vec![0i32; VOCAB];
+                for (v, p) in leaf.iter().enumerate() {
+                    at[*p] = v as i32;
+                }
+                Tensor::from_data(TensorData::new(at, [VOCAB]), device)
+            },
         }
     }
 
@@ -215,7 +371,21 @@ impl Tree {
         let [b, n] = z.dims();
         let low = self.sigmoid.clone().select(0, z.clone().abs().clamp(0, LOGIT_SPAN).reshape([b * n])).reshape([b, n]);
         // low is sigma(-|z|); for z >= 0 the answer is its complement
-        (low.clone() + z.greater_equal_elem(0).int() * (low * -2 + 4096)).clamp(1, 4095)
+        // (z + 1).clamp(0, 1) is 1 exactly where z >= 0; a compare costs several times as much
+        (low.clone() + (z + 1).clamp(0, 1) * (low * -2 + 4096)).clamp(1, 4095)
+    }
+
+    /// Node probabilities to each byte's Q8 log-probability, `[B, VOCAB]`: the sum of the logs of
+    /// the branches on its path. This is what lets a tree head join a mix of per-byte scores.
+    fn log_scores(&self, p: &Tensor<2, Int>) -> Tensor<2, Int> {
+        if fused::on_gpu(p) {
+            return fused::tree_log_scores(p, &self.leaf, &self.logp);
+        }
+        let [b, n] = p.dims();
+        let log = |q: Tensor<2, Int>| self.logp.clone().select(0, q.reshape([b * n])).reshape([b, n]);
+        // every node's log-probability of each branch, then summed along each byte's path by the
+        // path tables: 8 terms of magnitude at most 4095 per byte
+        log(p.clone()).matmul(self.right_t.clone()) + log(p.clone() * -1 + 4096).matmul(self.left_t.clone())
     }
 
     /// Node probabilities to byte weights `[B, VOCAB]` on the softmax's Q20 scale.
@@ -246,24 +416,43 @@ pub struct Config {
     pub lr: u32,
     pub rule: Rule,
     pub head: Head,
-    /// Feed the head a long-range match proposal (softmax head only).
+    /// Feed the head a long-range match proposal.
     pub matcher: bool,
+    /// Sum-product network: distributions per leaf region (and sum nodes per layer), and the
+    /// number of random replicas.
+    pub comps: usize,
+    pub replicas: usize,
+    /// Extra attention branch over only the last `short` bytes (0 for none, else 2 or 4).
+    pub short: usize,
+    /// Sum-product network structure adaptation: 0 off, 1 prune weak children, 2 prune and regrow.
+    pub adapt: u8,
+    /// Steps after which the bytes coded so far are trained on once more (0 for never).
+    pub warm: usize,
+    /// Normalise the hidden layer's pre-activations per unit with running statistics.
+    pub norm: bool,
     pub seed: u64,
 }
 
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
-        if self.arch == Arch::Spn {
-            // the batch bound keeps the replica-mix gradient (256 * 2^12 * B) inside i32
+        if self.arch != Arch::Attn {
+            // the batch bound keeps the network's batch-summed gradients inside i32
             let ok = self.ctx == crate::spn::CTX
-                && (2..=8).contains(&self.emb)
-                && (1..=crate::spn::MAX_FAN_IN).contains(&self.hid)
+                // comps^2 is a sum node's fan-in, which the log table covers up to 256
+                && (2..=16).contains(&self.comps)
+                && (1..=crate::spn::MAX_FAN_IN).contains(&self.replicas)
                 && self.batch.is_power_of_two()
                 && (CHUNK..=512).contains(&self.batch)
-                && (6..=22).contains(&self.lr)
-                && self.head == Head::Softmax
-                && !self.matcher;
-            return if ok { Ok(()) } else { Err(format!("unsupported sum-product network shape: {self:?}")) };
+                && (6..=22).contains(&self.lr);
+            if !ok {
+                return Err(format!("unsupported sum-product network shape: {self:?}"));
+            }
+            if self.arch == Arch::Spn {
+                return Ok(());
+            }
+        }
+        if ![0, 2, 4].contains(&self.short) || self.adapt > 2 || self.warm > u16::MAX as usize {
+            return Err(format!("unsupported options: {self:?}"));
         }
         let ok = self.ctx.is_power_of_two()
             && self.ctx <= 64
@@ -273,8 +462,7 @@ impl Config {
             && self.ctx * self.emb <= 256
             && self.emb <= 64
             && (1..=256).contains(&self.hid)
-            && (6..=22).contains(&self.lr)
-            && !(self.matcher && self.head != Head::Softmax);
+            && (6..=22).contains(&self.lr);
         if ok { Ok(()) } else { Err(format!("unsupported model shape: {self:?}")) }
     }
 }
@@ -304,11 +492,74 @@ pub struct Model {
     pub cfg: Config,
     pub p: Params,
     lut: Tensor<1, Int>,
+    below: Tensor<2, Int>,
+    /// Identity tables, selected by row in place of `one_hot`.
+    eye: Tensor<2, Int>,
+    eye3: Tensor<2, Int>,
     tree: Option<Tree>,
     opt: Optimizer,
     /// The forward pass awaiting its targets.
     pending: Option<Cache>,
+    /// Hidden activations of the last trained batch, kept for [`Self::health`].
+    last_hidden: Option<Tensor<2, Int>>,
+    /// Normalised hidden layer (`cfg.norm`): per unit, the gain that brings the spread of its
+    /// pre-activation to [`NORM_SPREAD`].
+    norm: Norm,
+    /// Constant zeros: the match proposal of a model without one, `[B, 2]`, and the copy gain's
+    /// gradient when nothing trains it, `[3, 1]`.
+    no_guess: Tensor<2, Int>,
+    zero3: Tensor<2, Int>,
     device: Device,
+}
+
+/// Running spread of each hidden unit's pre-activation, and the gain that normalises it. The
+/// forward pass reads the gain as a constant, so the backward pass through the layer is a plain
+/// multiply by it, and both sides of the codec hold the same value at every step.
+///
+/// Only the spread is normalised. Subtracting the running mean as well was tried and cost over a
+/// third of the ratio: the lower layers' weights ran to their clamps.
+struct Norm {
+    /// The gain scaled by 2^[`NORM_EMA`], so the exponential average loses nothing to rounding.
+    gain_acc: Tensor<2, Int>,
+    /// Q8, `[1, hid]`.
+    gain: Tensor<2, Int>,
+}
+
+impl Norm {
+    fn new(hid: usize, device: &Device) -> Self {
+        // gain 1.0: the layer starts as the identity
+        let gain = Tensor::<2, Int>::zeros([1, hid], device) + 256;
+        Self { gain_acc: gain.clone() * (1 << NORM_EMA), gain }
+    }
+
+    /// Folds one batch of pre-activations `[B, hid]` into the running gain.
+    fn observe(&mut self, z1: Tensor<2, Int>) {
+        let [b, hid] = z1.dims();
+        let rows = b.trailing_zeros();
+        // cut so that a column of deviations sums to under 2^29
+        let lim = ((1i32 << 28) / b as i32).min(NORM_IN);
+        let z = z1.clamp(-lim, lim);
+        let mean = shr_floor(z.clone().sum_dim(0), rows);
+        // mean absolute deviation: a spread that needs no square root
+        let mad = shr_floor((z - mean).abs().sum_dim(0), rows);
+        // both sides non-negative, so the division means the same on every backend
+        let gain = ((Tensor::<2, Int>::zeros([1, hid], &mad.device()) + 256 * NORM_SPREAD) / (mad + 1)).clamp(NORM_GAIN_MIN, NORM_GAIN_MAX);
+        self.gain_acc = self.gain_acc.clone() + gain - self.gain.clone();
+        self.gain = shr_floor(self.gain_acc.clone(), NORM_EMA);
+    }
+}
+
+/// What the attention block hands on: the context bytes, `[B t]`; the embedded context and its
+/// queries, keys and values, `[B, t, e]`; the attention weights, `[B, t, t]`; and the block's
+/// output, `[B, t e]`.
+struct Attended {
+    idx: Tensor<1, Int>,
+    x: Tensor<3, Int>,
+    q: Tensor<3, Int>,
+    k: Tensor<3, Int>,
+    v: Tensor<3, Int>,
+    a: Tensor<3, Int>,
+    zf: Tensor<2, Int>,
 }
 
 /// Everything one forward pass leaves behind for the coder and for the update.
@@ -321,16 +572,21 @@ pub struct Cache {
     a: Tensor<3, Int>,
     zf: Tensor<2, Int>,
     h: Tensor<2, Int>,
+    /// With the normalised hidden layer: the raw pre-activations and the gain they were scaled by.
+    norm: Option<(Tensor<2, Int>, Tensor<2, Int>)>,
+    /// Output scores before the match boost and the head.
+    out: Tensor<2, Int>,
     e: Tensor<2, Int>,
     /// Q12: byte probabilities for the softmax head, node probabilities for a tree head.
     prob: Tensor<2, Int>,
+    /// The weights the pass was made with, as Q16 shadows.
     wq: Tensor<2, Int>,
     wk: Tensor<2, Int>,
     wv: Tensor<2, Int>,
     w1: Tensor<2, Int>,
     w2: Tensor<2, Int>,
-    /// The match proposal: byte `[B, 1]` and trust level `[B]`.
-    guess: (Tensor<2, Int>, Tensor<1, Int>),
+    /// The match proposal as it came, `[B, 2]`; see [`split_guess`].
+    guess_raw: Tensor<2, Int>,
 }
 
 impl Cache {
@@ -361,163 +617,393 @@ impl Model {
         };
         let tree = (cfg.head != Head::Softmax).then(|| Tree::new(cfg.head == Head::RandomTree, cfg.seed, device));
         let lut = Tensor::from_data(TensorData::new(exp_lut(), [LOGIT_SPAN as usize + 1]), device);
-        Self { cfg, p, lut, tree, opt: Optimizer::new(cfg.rule, cfg.lr, 8), pending: None, device: device.clone() }
+        Self { cfg, p, lut, below: below_table(device), eye: one_hot_rows(VOCAB, device), eye3: one_hot_rows(3, device), tree, opt: Optimizer::new(cfg.rule, cfg.lr, 8).with_offsets(&GROUP_OFFSETS), pending: None, last_hidden: None, norm: Norm::new(cfg.hid, device), no_guess: Tensor::zeros([cfg.batch, 2], device), zero3: Tensor::zeros([3, 1], device), device: device.clone() }
     }
 
-    /// Integer softmax over the last dim of Q8 logits: returns (Q20 weights, Q12 probabilities).
     fn softmax<const D: usize>(&self, logits: Tensor<D, Int>) -> (Tensor<D, Int>, Tensor<D, Int>) {
-        let dims = logits.dims();
-        let n: usize = dims.iter().product();
-        let d = (logits.clone().max_dim(D - 1) - logits).clamp(0, LOGIT_SPAN);
-        let e = self.lut.clone().select(0, d.reshape([n])).reshape(dims);
-        // sum(e) is in [2^20, 2^28]; it is non-negative, so the raw shift is safe
-        let p = e.clone() / e.clone().sum_dim(D - 1).bitwise_right_shift_scalar(12);
-        (e, p)
+        softmax_q12(&self.lut, logits)
+    }
+
+    /// The network up to its output scores, `[B, outputs]` in Q8, for a caller that applies its
+    /// own head (see [`crate::mix::Mix`]). Train with [`Self::learn_from`].
+    pub fn scores(&self, ctx: Tensor<2, Int>) -> (Tensor<2, Int>, Cache) {
+        let cache = self.pass(ctx, self.no_guess.clone(), false);
+        match &self.tree {
+            None => (cache.out.clone(), cache),
+            // a tree head's per-byte score is the byte's log-probability under the tree
+            Some(tree) => (tree.log_scores(&cache.prob), cache),
+        }
+    }
+
+    /// Trains on the error `g = dL/dscores` (Q12) for a pass made by [`Self::scores`].
+    pub fn learn_from(&mut self, c: &Cache, g: Tensor<2, Int>) {
+        let g = match &self.tree {
+            None => g,
+            // Back from per-byte errors to node logits: a node's logit raises the log-probability
+            // of the bytes in its 1-branch by (1 - sigma) and lowers the rest of its subtree by
+            // sigma. |g @ table| <= sum |g| <= 2^13, and times a Q12 probability stays under 2^26.
+            Some(tree) if fused::on_gpu(&g) => fused::tree_back(g, &c.prob, &tree.byte_at),
+            Some(tree) => {
+                let right = g.clone().matmul(tree.right.clone());
+                let under = g.matmul(tree.on_path.clone());
+                (right - shr_round(c.prob.clone() * under, 12)).clamp(-4096, 4096)
+            }
+        };
+        self.train(c, g, self.zero3.clone());
+    }
+
+    /// One training step from the error at the output scores and the copy gain's gradient. On
+    /// the GPU under a plain SGD rule every weight group's gradient and step are one kernel.
+    fn train(&mut self, c: &Cache, g: Tensor<2, Int>, dcopy: Tensor<2, Int>) {
+        let steps = if fused::on_gpu(&g) { self.opt.device_steps(&self.device) } else { None };
+        if let Some(steps) = steps {
+            self.opt.tick();
+            let mut p = self.grads_from(c, g, dcopy, Some(&steps));
+            // without the match finder the gain's gradient is zero and so is the gain
+            p.copy = if self.cfg.matcher { self.opt.step(7, &self.p.copy, p.copy, SGD_COPY, SHADOW_MAX) } else { self.p.copy.clone() };
+            self.p = p;
+            crate::ops::prof::lap(&self.device, "b: optimiser");
+        } else {
+            let grads = self.grads_from(c, g, dcopy, None);
+            self.apply(grads);
+        }
+        self.trained(c);
+    }
+
+    /// Bookkeeping after a training step on the pass `c`.
+    fn trained(&mut self, c: &Cache) {
+        self.last_hidden = Some(c.h.clone());
+        if let Some((z1, _)) = &c.norm {
+            self.norm.observe(z1.clone());
+        }
     }
 
     /// `ctx` is `[B, ctx]` byte values. Nothing here depends on the bytes being predicted.
     pub fn forward(&self, ctx: Tensor<2, Int>, guess: Tensor<2, Int>) -> Cache {
-        let Config { ctx: t, emb: e, batch: b, .. } = self.cfg;
-        let (wq, wk, wv) = (shr_floor(self.p.wq.clone(), 8), shr_floor(self.p.wk.clone(), 8), shr_floor(self.p.wv.clone(), 8));
-        let (w1, w2) = (shr_floor(self.p.w1.clone(), 8), shr_floor(self.p.w2.clone(), 8));
+        self.pass(ctx, guess, true)
+    }
 
+    /// [`Self::forward`]; without `weights` the byte weights are left out (`e` is then a
+    /// placeholder, and so is a softmax head's `prob`), for a mix that applies its own head.
+    fn pass(&self, ctx: Tensor<2, Int>, guess: Tensor<2, Int>, weights: bool) -> Cache {
+        let Config { ctx: t, emb: e, batch: b, .. } = self.cfg;
+        // The weights go to the fused matmuls as shadows, which shift them to Q8 as they read.
+        let (wq, wk, wv, w1, w2) = (self.p.wq.clone(), self.p.wk.clone(), self.p.wv.clone(), self.p.w1.clone(), self.p.w2.clone());
+        let layer = |bound: i32| Mat { wt: false, wshift: 8, shift: 8, bound };
+
+        // a model over fewer bytes than the context reads only the last of them
+        let width = ctx.dims()[1];
+        if fused::on_gpu(&ctx) && fused::attention_fits(t, e) {
+            let (idx, x, q, k, v, a, zf) = fused::attn_forward(&ctx, &self.p.emb, &self.p.pos, [&wq, &wk, &wv], &self.lut, t, LOGIT_SPAN);
+            let three = |m: Tensor<2, Int>| m.reshape([b, t, e]);
+            let parts = Attended { idx, x: three(x), q: three(q), k: three(k), v: three(v), a: a.reshape([b, t, t]), zf };
+            crate::ops::prof::lap(&self.device, "f: attention");
+            return self.head(parts, guess, weights, (wq, wk, wv, w1, w2));
+        }
+        let ctx = if width > t { ctx.narrow(1, width - t, t) } else { ctx };
         let idx = ctx.reshape([b * t]);
         // |x| <= 128 + 128 = 2^8
-        let x = shr_floor(self.p.emb.clone(), 8).select(0, idx.clone()).reshape([b, t, e])
-            + shr_floor(self.p.pos.clone(), 8).unsqueeze::<3>();
+        let x = if fused::on_gpu(&idx) {
+            fused::embed(&self.p.emb, &self.p.pos, &idx).reshape([b, t, e])
+        } else {
+            shr_floor(self.p.emb.clone(), 8).select(0, idx.clone()).reshape([b, t, e]) + shr_floor(self.p.pos.clone(), 8).unsqueeze::<3>()
+        };
         let xf = x.clone().reshape([b * t, e]);
         // |x @ w| <= 64 * 2^8 * 2^10 = 2^24
-        let proj = |w: &Tensor<2, Int>| {
-            shr_floor(xf.clone().matmul(w.clone()), 8).clamp(-ACT_MAX, ACT_MAX).reshape([b, t, e])
-        };
+        let proj = |w: &Tensor<2, Int>| fused::matmul(xf.clone(), w.clone(), layer(ACT_MAX)).reshape([b, t, e]);
+        crate::ops::prof::lap(&self.device, "f: weights, embed");
         let (q, k, v) = (proj(&wq), proj(&wk), proj(&wv));
+        crate::ops::prof::lap(&self.device, "f: q k v");
         // |q @ k^T| <= 64 * 2^10 * 2^10 = 2^26
-        let (_, a) = self.softmax(shr_floor(q.clone().matmul(k.clone().transpose()), 12));
+        let a = fused::attn_probs(q.clone(), k.clone(), &self.lut);
         // |a @ v| <= 64 * 2^12 * 2^10 = 2^28
-        let y = shr_floor(a.clone().matmul(v.clone()), 12);
+        let y = fused::small_matmul(a.clone(), v.clone(), false, 12, UNBOUNDED);
         let zf = (x.clone() + y).clamp(-ACT_MAX, ACT_MAX).reshape([b, t * e]);
+        crate::ops::prof::lap(&self.device, "f: attention");
+        self.head(Attended { idx, x, q, k, v, a, zf }, guess, weights, (wq, wk, wv, w1, w2))
+    }
+
+    /// The pass from the attention block's output on: the hidden layer and the head.
+    #[allow(clippy::type_complexity)]
+    fn head(
+        &self,
+        Attended { idx, x, q, k, v, a, zf }: Attended,
+        guess: Tensor<2, Int>,
+        weights: bool,
+        (wq, wk, wv, w1, w2): (Tensor<2, Int>, Tensor<2, Int>, Tensor<2, Int>, Tensor<2, Int>, Tensor<2, Int>),
+    ) -> Cache {
+        let b = self.cfg.batch;
+        let layer = |bound: i32| Mat { wt: false, wshift: 8, shift: 8, bound };
         // |zf @ w1| <= 256 * 1023 * 1023 < 2^28
-        let h = shr_floor(zf.clone().matmul(w1.clone()), 8).clamp(0, ACT_MAX);
+        let z1 = fused::matmul(zf.clone(), w1.clone(), layer(UNBOUNDED));
+        let (z1, norm) = if self.cfg.norm {
+            // |cut| <= 2^17 and gain <= 2^12
+            let cut = z1.clone().clamp(-NORM_IN, NORM_IN);
+            (shr_floor(cut * self.norm.gain.clone(), 8), Some((z1, self.norm.gain.clone())))
+        } else {
+            (z1, None)
+        };
+        let h = if leaky() {
+            // leaky ReLU, slope 1/8 below zero, so a unit that is off still gets a gradient
+            z1.clone().clamp(0, ACT_MAX) + shr_floor(z1.clamp(-8 * ACT_MAX, 0), 3)
+        } else {
+            z1.clamp(0, ACT_MAX)
+        };
         // |h @ w2| <= 256 * 1023 * 1023 < 2^28
-        let mut out = shr_floor(h.clone().matmul(w2.clone()), 8);
-        let guess = (guess.clone().narrow(1, 0, 1), guess.narrow(1, 1, 1).reshape([b]));
-        if self.cfg.matcher {
+        let scores = fused::matmul(h.clone(), w2.clone(), layer(UNBOUNDED));
+        let mut out = scores.clone();
+        crate::ops::prof::lap(&self.device, "f: hidden, scores");
+        let guess_raw = guess;
+        if self.cfg.matcher && self.tree.is_none() {
+            let guess = split_guess(&guess_raw);
             // raise the proposed byte's logit by the gain learned for this trust level
             let gain = shr_floor(self.p.copy.clone(), 6).select(0, guess.1.clone());
-            out = out + guess.0.clone().reshape([b]).one_hot::<2>(VOCAB) * gain;
+            out = out + self.eye.clone().select(0, guess.0.clone().reshape([b])) * gain;
         }
         let (e_out, prob) = match &self.tree {
+            None if !weights => (scores.clone(), scores.clone()),
             None => self.softmax(out),
+            Some(tree) if !weights && fused::on_gpu(&out) => {
+                let p = fused::tree_probs(out, &tree.sigmoid, LOGIT_SPAN);
+                (p.clone(), p)
+            }
+            Some(tree) if fused::on_gpu(&out) => {
+                let p = fused::tree_probs(out, &tree.sigmoid, LOGIT_SPAN);
+                let e = fused::tree_leaves(&p, &tree.leaf, &guess_raw, &self.p.copy, &self.lut, self.cfg.matcher, LOGIT_SPAN);
+                (e, p)
+            }
             Some(tree) => {
                 let p = tree.probs(out);
-                (tree.leaves(&p), p)
+                let mut e = tree.leaves(&p);
+                if self.cfg.matcher {
+                    let guess = split_guess(&guess_raw);
+                    // The tree has no per-byte logit to raise, so the boost scales every other
+                    // byte's weight down by exp(-gain) instead; the coder normalises by the row
+                    // total either way. Both factors are cut to 10 bits so the product fits.
+                    let gain = shr_floor(self.p.copy.clone(), 6).select(0, guess.1.clone()).clamp(0, LOGIT_SPAN);
+                    let keep = self.lut.clone().select(0, gain.reshape([b])).reshape([b, 1]).bitwise_right_shift_scalar(10);
+                    let proposed = self.eye.clone().select(0, guess.0.clone().reshape([b]));
+                    e = e.bitwise_right_shift_scalar(10) * (proposed.clone() * 1024 + (proposed * -1 + 1) * keep);
+                }
+                (e, p)
             }
         };
-        Cache { idx, x, q, k, v, a, zf, h, e: e_out, prob, wq, wk, wv, w1, w2, guess }
+        crate::ops::prof::lap(&self.device, "f: head");
+        Cache { idx, x, q, k, v, a, zf, h, norm, out: scores, e: e_out, prob, wq, wk, wv, w1, w2, guess_raw }
     }
 
     /// Gradients of the summed code length, on a per-128-rows scale, in `Params` layout.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn grads(&self, c: &Cache, target: Tensor<1, Int>) -> Params {
-        let Config { ctx: t, emb: e, batch: b, .. } = self.cfg;
-        let clamp_err = |x: Tensor<3, Int>| x.clamp(-ERR_MAX, ERR_MAX);
+        let (g, dcopy) = self.head_error(c, target);
+        self.grads_from(c, g, dcopy, None)
+    }
+
+    /// The error at the output scores and the copy gain's gradient.
+    fn head_error(&self, c: &Cache, target: Tensor<1, Int>) -> (Tensor<2, Int>, Tensor<2, Int>) {
+        let b = self.cfg.batch;
 
         // head: dL/dlogits in Q12, |g| <= 2^12. Softmax: p - onehot. Tree: sigma - bit at the 8
         // nodes on the byte's path, zero elsewhere.
+        let gpu = fused::on_gpu(&target);
         let g = match &self.tree {
-            None => c.prob.clone() - target.one_hot::<2>(VOCAB) * 4096,
+            None if gpu => fused::onehot_error(c.prob.clone(), target.clone(), 4096),
+            Some(tree) if gpu => fused::tree_error(&c.prob, &target, &tree.leaf),
+            None => c.prob.clone() - self.eye.clone().select(0, target.clone()) * 4096,
             Some(tree) => {
-                tree.on_path.clone().select(0, target.clone()) * (c.prob.clone() - tree.bit_q12.clone().select(0, target))
+                tree.on_path.clone().select(0, target.clone()) * (c.prob.clone() - tree.bit_q12.clone().select(0, target.clone()))
             }
         };
         // d/dgain = the proposed byte's error, summed over the rows at each trust level:
         // at most B * 2^12 <= 2^27, then averaged down to the per-128-rows scale
-        let dcopy = if self.cfg.matcher {
-            let at_guess = g.clone().gather(1, c.guess.0.clone());
-            shr_round0(c.guess.1.clone().one_hot::<2>(3).transpose().matmul(at_guess), (b / CHUNK).trailing_zeros())
+        let dcopy = if self.cfg.matcher && gpu {
+            // softmax: the proposed byte's probability; tree: its share of the boosted weights
+            let (weights, normalise) = if self.tree.is_none() { (&c.prob, false) } else { (&c.e, true) };
+            fused::copy_error(weights, &target, &c.guess_raw, normalise, (b / CHUNK).trailing_zeros())
+        } else if self.cfg.matcher {
+            let guess = split_guess(&c.guess_raw);
+            // For a tree head the boost acts on the byte weights after the tree, so its error is
+            // taken there: the boosted distribution's probability of the proposed byte, minus
+            // whether that byte was right. The tree itself still trains on its own distribution.
+            let at_guess = match &self.tree {
+                None => g.clone().gather(1, guess.0.clone()),
+                Some(_) => {
+                    let p = c.e.clone() / c.e.clone().sum_dim(1).bitwise_right_shift_scalar(12).clamp(1, i32::MAX);
+                    let hit = self.eye.clone().select(0, target.clone()).gather(1, guess.0.clone());
+                    p.gather(1, guess.0.clone()) - hit * 4096
+                }
+            };
+            shr_round0(self.eye3.clone().select(0, guess.1.clone()).transpose().matmul(at_guess), (b / CHUNK).trailing_zeros())
         } else {
-            Tensor::zeros([3, 1], &self.device)
+            self.zero3.clone()
         };
-        // chunk sums: 128 * 2^10 * 2^12 = 2^29
-        let dw2 = xty(c.h.clone(), g.clone());
+        crate::ops::prof::lap(&self.device, "b: head error, copy");
+        (g, dcopy)
+    }
+
+    /// The backward pass from the error at the output scores, `|g| <= 2^12`. With `step`, which
+    /// needs the GPU and an [`Optimizer::sgd`] rule, every group but the copy gain comes back
+    /// already stepped: the new weights in place of the gradients.
+    fn grads_from(&self, c: &Cache, g: Tensor<2, Int>, dcopy: Tensor<2, Int>, step: Option<&Tensor<1, Int>>) -> Params {
+        let Config { ctx: t, emb: e, batch: b, .. } = self.cfg;
+        // `slot` is the group's place in the optimizer, as in [`Self::apply`]
+        let group = |x: Tensor<2, Int>, y: Tensor<2, Int>, w: &Tensor<2, Int>, slot: usize| match step {
+            Some(steps) => fused::xty_sgd(x, y, w, CHUNK, (steps, slot), SHADOW_MAX),
+            None => xty(x, y),
+        };
+        // On the GPU a step writes its weights in place, so every group's weights are read for
+        // the error they pass back before that group is stepped.
         // |g @ w2^T| <= 256 * 4096 * 1023 < 2^30
-        let dh = shr_floor(g.matmul(c.w2.clone().transpose()), 8);
-        let live = c.h.clone().greater_elem(0).int() * c.h.clone().lower_elem(ACT_MAX).int();
-        let dh = (dh * live).clamp(-ERR_MAX, ERR_MAX);
+        let back = |bound: i32| Mat { wt: true, wshift: 8, shift: 8, bound };
+        let dh = fused::matmul(g.clone(), c.w2.clone(), back(UNBOUNDED));
+        let dh = if leaky() {
+            // slope 1 above zero (saturation passes straight through), 1/8 at or below it
+            shr_floor(dh.clamp(-ERR_MAX, ERR_MAX) * (c.h.clone().clamp(0, 1) * 7 + 1), 3)
+        } else if fused::on_gpu(&dh) {
+            fused::relu_error(dh, &c.h, ACT_MAX, ERR_MAX)
+        } else {
+            // 1 where 0 < h < ACT_MAX, by clamps: a compare costs several times as much
+            let live = c.h.clone().clamp(0, 1) * (c.h.clone() * -1 + ACT_MAX).clamp(0, 1);
+            (dh * live).clamp(-ERR_MAX, ERR_MAX)
+        };
+        // through the normalisation, whose gain was a constant of the pass:
+        // |dh * gain| <= 2^12 * 2^12
+        let dh = match &c.norm {
+            Some((_, gain)) => shr_floor(dh * gain.clone(), 8).clamp(-ERR_MAX, ERR_MAX),
+            None => dh,
+        };
+        crate::ops::prof::lap(&self.device, "b: dh");
         // chunk sums: 128 * 2^10 * 2^12 = 2^29
-        let dw1 = xty(c.zf.clone(), dh.clone());
+        let dw2 = group(c.h.clone(), g, &self.p.w2, 6);
+        crate::ops::prof::lap(&self.device, "b: dw2");
         // |dh @ w1^T| <= 256 * 4095 * 1023 < 2^30
-        let dz = shr_floor(dh.matmul(c.w1.clone().transpose()), 8).clamp(-ERR_MAX, ERR_MAX).reshape([b, t, e]);
+        let dz = fused::matmul(dh.clone(), c.w1.clone(), back(ERR_MAX)).reshape([b, t, e]);
+        // chunk sums: 128 * 2^10 * 2^12 = 2^29
+        let dw1 = group(c.zf.clone(), dh, &self.p.w1, 5);
+        crate::ops::prof::lap(&self.device, "b: dw1");
 
+        crate::ops::prof::lap(&self.device, "b: dz");
         // attention: y = a @ v
-        // |dz @ v^T| <= 64 * 2^12 * 2^10 = 2^28
-        let da = clamp_err(shr_floor(dz.clone().matmul(c.v.clone().transpose()), 10));
         // |a^T @ dz| <= ctx * 4096 * 4095 < 2^30 for ctx <= 64
-        let dv = clamp_err(shr_floor(c.a.clone().transpose().matmul(dz.clone()), 12));
-        // softmax: ds = a * (da - sum_j a_j da_j); |sum| <= 2^12 * 2^12 after the row sums to 2^12
-        let mean = shr_floor((c.a.clone() * da.clone()).sum_dim(2), 12);
-        // |a * (da - mean)| <= 2^12 * 2^13 = 2^25
-        let ds = clamp_err(shr_floor(c.a.clone() * (da - mean), 12));
+        let dv = fused::small_matmul(c.a.clone(), dz.clone(), true, 12, ERR_MAX);
+        let ds = fused::attn_ds(dz.clone(), c.v.clone(), c.a.clone(), ERR_MAX);
         // |ds @ k| and |ds^T @ q| <= 64 * 2^12 * 2^10 = 2^28
-        let dq = clamp_err(shr_floor(ds.clone().matmul(c.k.clone()), 8));
-        let dk = clamp_err(shr_floor(ds.transpose().matmul(c.q.clone()), 8));
-
+        let dq = fused::small_matmul(ds.clone(), c.k.clone(), false, 8, ERR_MAX);
+        let dk = fused::small_matmul(ds, c.q.clone(), true, 8, ERR_MAX);
+        crate::ops::prof::lap(&self.device, "b: attention");
         let flat = |x: &Tensor<3, Int>| x.clone().reshape([b * t, e]);
         let xf = flat(&c.x);
         let (dqf, dkf, dvf) = (flat(&dq), flat(&dk), flat(&dv));
-        // chunk sums: 128 * 2^8 * 2^12 = 2^27
-        let (dwq, dwk, dwv) = (xty(xf.clone(), dqf.clone()), xty(xf.clone(), dkf.clone()), xty(xf, dvf.clone()));
         // each term <= 64 * 2^12 * 2^10 = 2^28; the three are shifted before they are added
-        let back = |d: Tensor<2, Int>, w: &Tensor<2, Int>| shr_floor(d.matmul(w.clone().transpose()), 8);
-        let dx = (flat(&dz) + (back(dqf, &c.wq) + back(dkf, &c.wk) + back(dvf, &c.wv)).clamp(-ERR_MAX, ERR_MAX))
+        let through = |d: Tensor<2, Int>, w: &Tensor<2, Int>| fused::matmul(d, w.clone(), back(UNBOUNDED));
+        let dx = (flat(&dz) + (through(dqf.clone(), &c.wq) + through(dkf.clone(), &c.wk) + through(dvf.clone(), &c.wv)).clamp(-ERR_MAX, ERR_MAX))
             .clamp(-ERR_MAX, ERR_MAX);
+        // chunk sums: 128 * 2^8 * 2^12 = 2^27
+        let (dwq, dwk, dwv) = match step {
+            Some(steps) if fused::qkv_fits(e) => {
+                let [q, k, v] = fused::qkv_sgd(&xf, [&dqf, &dkf, &dvf], [&self.p.wq, &self.p.wk, &self.p.wv], CHUNK, steps, 2, SHADOW_MAX);
+                (q, k, v)
+            }
+            _ => (group(xf.clone(), dqf, &self.p.wq, 2), group(xf.clone(), dkf, &self.p.wk, 3), group(xf, dvf, &self.p.wv, 4)),
+        };
+        crate::ops::prof::lap(&self.device, "b: dwq dwk dwv");
 
         // Row sums: B * ctx rows of magnitude 2^12. Up to 2^18 rows fit in 2^30 as they are; past
         // that the rows are pre-shifted by the excess. The rest of the averaging xty does (down to
         // a per-128-rows scale) happens after the sum, where it costs no precision.
+        crate::ops::prof::lap(&self.device, "b: dx");
         let rows_log2 = (b * t / CHUNK).trailing_zeros();
         let pre = (b * t).trailing_zeros().saturating_sub(18);
         let dxs = shr_round0(dx, pre);
-        let demb = Tensor::<2, Int>::zeros([VOCAB, e], &self.device).select_assign(
-            0,
-            c.idx.clone(),
-            dxs.clone(),
-            IndexingUpdateOp::Add,
-        );
-        let demb = shr_round0(demb, rows_log2 - pre);
-        let dpos = shr_round0(dxs.reshape([b, t, e]).sum_dim(0).reshape([t, e]), rows_log2 - pre);
+        let (demb, dpos) = match step {
+            Some(steps) if fused::embed_pos_fits(t, e) => fused::embed_pos_sgd(&c.idx, &dxs, &self.p.emb, &self.p.pos, rows_log2 - pre, steps, [0, 1], SHADOW_EMB_MAX),
+            Some(steps) if 256 % e == 0 => (
+                fused::embed_sgd(&c.idx, &dxs, &self.p.emb, t, false, rows_log2 - pre, (steps, 0), SHADOW_EMB_MAX),
+                fused::embed_sgd(&c.idx, &dxs, &self.p.pos, t, true, rows_log2 - pre, (steps, 1), SHADOW_EMB_MAX),
+            ),
+            step => {
+                let demb = fused::rows_by_value(c.idx.clone(), dxs.clone(), VOCAB, rows_log2 - pre);
+                let dpos = if fused::on_gpu(&dxs) {
+                    fused::place_sums(&dxs, t, rows_log2 - pre)
+                } else {
+                    shr_round0(dxs.reshape([b, t, e]).sum_dim(0).reshape([t, e]), rows_log2 - pre)
+                };
+                match step {
+                    Some(steps) => (fused::sgd_step(&self.p.emb, demb, (steps, 0), SHADOW_EMB_MAX), fused::sgd_step(&self.p.pos, dpos, (steps, 1), SHADOW_EMB_MAX)),
+                    None => (demb, dpos),
+                }
+            }
+        };
 
+        crate::ops::prof::lap(&self.device, "b: demb dpos");
         Params { emb: demb, pos: dpos, wq: dwq, wk: dwk, wv: dwv, w1: dw1, w2: dw2, copy: dcopy }
     }
 
     pub fn apply(&mut self, g: Params) {
-        // log2 of how much smaller each group's gradient scale is than the head's, measured
-        // against autodiff in the test below
-        const EMB: i32 = 11;
-        const VALUE: i32 = 3;
-        const QUERY_KEY: i32 = 1;
-        // its input is a bare 1 where the head's inputs are Q8 activations
-        const COPY: i32 = 6;
         let o = &mut self.opt;
         o.tick();
         self.p = Params {
-            emb: o.step(0, &self.p.emb, g.emb, EMB, SHADOW_EMB_MAX),
-            pos: o.step(1, &self.p.pos, g.pos, EMB, SHADOW_EMB_MAX),
-            wq: o.step(2, &self.p.wq, g.wq, QUERY_KEY, SHADOW_MAX),
-            wk: o.step(3, &self.p.wk, g.wk, QUERY_KEY, SHADOW_MAX),
-            wv: o.step(4, &self.p.wv, g.wv, VALUE, SHADOW_MAX),
+            emb: o.step(0, &self.p.emb, g.emb, SGD_EMB, SHADOW_EMB_MAX),
+            pos: o.step(1, &self.p.pos, g.pos, SGD_EMB, SHADOW_EMB_MAX),
+            wq: o.step(2, &self.p.wq, g.wq, SGD_QUERY_KEY, SHADOW_MAX),
+            wk: o.step(3, &self.p.wk, g.wk, SGD_QUERY_KEY, SHADOW_MAX),
+            wv: o.step(4, &self.p.wv, g.wv, SGD_VALUE, SHADOW_MAX),
             w1: o.step(5, &self.p.w1, g.w1, 0, SHADOW_MAX),
             w2: o.step(6, &self.p.w2, g.w2, 0, SHADOW_MAX),
-            copy: o.step(7, &self.p.copy, g.copy, COPY, SHADOW_MAX),
+            // without the match finder the gain's gradient is zero and so is the gain
+            copy: if self.cfg.matcher { o.step(7, &self.p.copy, g.copy, SGD_COPY, SHADOW_MAX) } else { self.p.copy.clone() },
         };
+        crate::ops::prof::lap(&self.device, "b: optimiser");
     }
 
     pub fn update(&mut self, c: &Cache, target: Tensor<1, Int>) {
-        let g = self.grads(c, target);
-        self.apply(g);
+        let (g, dcopy) = self.head_error(c, target);
+        self.train(c, g, dcopy);
     }
 }
 
 impl Model {
+    /// How much of the model can still learn: per weight group the share of weights pinned at
+    /// their clamp, and on the last batch the share of hidden units that were off or saturated
+    /// (both pass no gradient). Reads tensors back, so it is for diagnostics, not the coding loop.
+    pub fn health(&self) -> String {
+        let pinned = |t: &Tensor<2, Int>, max: i32| -> f64 {
+            let v: Vec<i32> = t.clone().into_data().convert::<i32>().try_to_vec().unwrap();
+            v.iter().filter(|x| x.abs() >= max).count() as f64 * 100.0 / v.len() as f64
+        };
+        let p = &self.p;
+        let mut out = format!(
+            "rate {}; pinned: emb {:.1}% pos {:.1}% wq {:.1}% wk {:.1}% wv {:.1}% w1 {:.1}% w2 {:.1}%",
+            self.opt.rate(),
+            pinned(&p.emb, SHADOW_EMB_MAX),
+            pinned(&p.pos, SHADOW_EMB_MAX),
+            pinned(&p.wq, SHADOW_MAX),
+            pinned(&p.wk, SHADOW_MAX),
+            pinned(&p.wv, SHADOW_MAX),
+            pinned(&p.w1, SHADOW_MAX),
+            pinned(&p.w2, SHADOW_MAX)
+        );
+        if let Some(h) = &self.last_hidden {
+            let v: Vec<i32> = h.clone().into_data().convert::<i32>().try_to_vec().unwrap();
+            let share = |f: &dyn Fn(i32) -> bool| v.iter().filter(|x| f(**x)).count() as f64 * 100.0 / v.len() as f64;
+            let width = self.cfg.hid;
+            // a unit is dead when it is off for every row of the batch
+            let dead = (0..width).filter(|u| v.iter().skip(*u).step_by(width).all(|x| *x == 0)).count();
+            out += &format!(
+                "; hidden: {:.1}% off, {:.1}% saturated, {dead} of {width} units off for the whole batch",
+                share(&|x| x == 0),
+                share(&|x| x >= ACT_MAX)
+            );
+        }
+        if self.cfg.norm {
+            let mut g: Vec<i32> = self.norm.gain.clone().into_data().convert::<i32>().try_to_vec().unwrap();
+            g.sort_unstable();
+            let x = |v: i32| v as f64 / 256.0;
+            out += &format!("; gain min {:.2} median {:.2} max {:.2}", x(g[0]), x(g[g.len() / 2]), x(g[g.len() - 1]));
+        }
+        out
+    }
+
     /// The learning rate currently in use (it moves under [`Rule::Auto`]).
     pub fn rate(&self) -> i32 {
         self.opt.rate()
@@ -537,6 +1023,9 @@ impl Model {
             .into_iter()
             .flat_map(|t| t.clone().into_data().convert::<i32>().try_to_vec::<i32>().unwrap())
             .collect();
+        if self.cfg.norm {
+            out.extend(self.norm.gain_acc.clone().into_data().convert::<i32>().try_to_vec::<i32>().unwrap());
+        }
         out.extend(self.opt.state());
         out
     }
@@ -545,7 +1034,9 @@ impl Model {
     pub fn import(&mut self, values: &[i32]) -> Result<(), String> {
         let shapes = Self::shapes(&self.cfg);
         let weights = shapes.iter().map(|s| s[0] * s[1]).sum::<usize>();
-        if values.len() != weights + Optimizer::state_len(8) {
+        let hid = self.cfg.hid;
+        let stats = if self.cfg.norm { hid } else { 0 };
+        if values.len() != weights + stats + Optimizer::state_len(8) {
             return Err("prior does not match the model shape".into());
         }
         let mut at = 0;
@@ -556,8 +1047,24 @@ impl Model {
         };
         let [emb, pos, wq, wk, wv, w1, w2, copy] = shapes.map(&mut next);
         self.p = Params { emb, pos, wq, wk, wv, w1, w2, copy };
-        self.opt.restore(&values[weights..], &self.device);
+        if self.cfg.norm {
+            let gain_acc = next([1, hid]);
+            self.norm = Norm { gain: shr_floor(gain_acc.clone(), NORM_EMA), gain_acc };
+        }
+        self.opt.restore(&values[weights + stats..], &self.device);
         Ok(())
+    }
+}
+
+impl Model {
+    /// See [`Predictor::graphable`]: GPU kernels for the whole step under a plain SGD rule, and
+    /// no running normalisation statistics (they are replaced, not updated in place).
+    pub fn graphable(&self) -> bool {
+        fused::on_gpu(&self.p.emb) && self.opt.sgd(0).is_some() && !self.cfg.norm && fused::attention_fits(self.cfg.ctx, self.cfg.emb)
+    }
+
+    pub fn refresh_steps(&mut self) {
+        let _ = self.opt.device_steps(&self.device);
     }
 }
 
@@ -569,6 +1076,13 @@ impl Predictor for Model {
         freqs
     }
 
+    fn predict_coded(&mut self, ctx: Tensor<2, Int>, guess: Tensor<2, Int>, target: Tensor<1, Int>) -> Tensor<2, Int> {
+        let cache = self.forward(ctx, guess);
+        let out = coded(cache.e.clone(), target, &self.below);
+        self.pending = Some(cache);
+        out
+    }
+
     fn learn(&mut self, target: Tensor<1, Int>) {
         let cache = self.pending.take().expect("learn without a preceding predict");
         self.update(&cache, target);
@@ -577,6 +1091,25 @@ impl Predictor for Model {
     fn observe(&mut self, cost_q8: u64) {
         self.opt.observe(cost_q8, 8 * 256 * self.cfg.batch as u64);
     }
+
+    fn health(&self) -> String {
+        Model::health(self)
+    }
+
+    fn graphable(&self) -> bool {
+        Model::graphable(self)
+    }
+
+    fn refresh_steps(&mut self) {
+        Model::refresh_steps(self)
+    }
+}
+
+/// A match proposal `[B, 2]` as its byte `[B, 1]` and trust level `[B]`, for the tensor code
+/// paths; the kernels read the pair as it comes.
+pub fn split_guess(guess: &Tensor<2, Int>) -> (Tensor<2, Int>, Tensor<1, Int>) {
+    let b = guess.dims()[0];
+    (guess.clone().narrow(1, 0, 1), guess.clone().narrow(1, 1, 1).reshape([b]))
 }
 
 /// [`shr_round`] that tolerates a zero shift.
@@ -590,7 +1123,7 @@ mod tests {
     use burn::tensor::activation::log_softmax;
 
     const CFG: Config =
-        Config { arch: Arch::Attn, ctx: 8, emb: 32, hid: 256, batch: 128, lr: 12, rule: Rule::Sgd, head: Head::Softmax, matcher: false, seed: 7 };
+        Config { arch: Arch::Attn, ctx: 8, emb: 32, hid: 256, batch: 128, lr: 12, rule: Rule::Sgd, head: Head::Softmax, matcher: false, comps: 4, replicas: 4, short: 0, adapt: 0, warm: 0, norm: false, seed: 7 };
 
     fn ints(t: &Tensor<2, Int>) -> Vec<i32> {
         t.clone().into_data().convert::<i32>().try_to_vec().unwrap()
@@ -626,7 +1159,7 @@ mod tests {
     }
 
     fn gradients_follow_autodiff(head: Head) {
-        let device = Device::flex();
+        let device = test_device();
         let mut rng = Rng(21);
         let mut model = Model::new(Config { head, ..CFG }, &device);
         // a few steps away from init, so attention is not uniform and the head is not symmetric
