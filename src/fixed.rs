@@ -128,6 +128,12 @@ pub fn coded(e: Tensor<2, Int>, target: Tensor<1, Int>, below: &Tensor<2, Int>) 
     Tensor::cat(vec![cum, own, f.sum_dim(1)], 1)
 }
 
+/// Temporary A/B switch: train a tree head through the match boost (see `Model::head_error`).
+fn through() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GMINT_THROUGH").is_some())
+}
+
 /// Temporary A/B switch while the leaky activation is being evaluated.
 fn leaky() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -814,6 +820,16 @@ impl Model {
         // head: dL/dlogits in Q12, |g| <= 2^12. Softmax: p - onehot. Tree: sigma - bit at the 8
         // nodes on the byte's path, zero elsewhere.
         let gpu = fused::on_gpu(&target);
+        // Experiment (GMINT_THROUGH=1): train a tree head with the match boost on through the
+        // boost, as a mix does: the error is taken at the coded distribution q (the boosted byte
+        // weights), q - onehot per byte, and carried back onto the tree's nodes; the boost's gain
+        // trains on the same error at the proposed byte.
+        if let (Some(tree), true, true) = (&self.tree, self.cfg.matcher && gpu, through()) {
+            let bytes = fused::mix_error(&c.e, target);
+            let g = fused::tree_back(bytes.clone(), &c.prob, &tree.byte_at);
+            let dcopy = fused::guess_sums(&bytes, &c.guess_raw, (b / CHUNK).trailing_zeros());
+            return (g, dcopy);
+        }
         let g = match &self.tree {
             None if gpu => fused::onehot_error(c.prob.clone(), target.clone(), 4096),
             Some(tree) if gpu => fused::tree_error(&c.prob, &target, &tree.leaf),
