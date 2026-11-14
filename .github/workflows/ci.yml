@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    # GitHub's runners have no GPU. The build needs none: without nvcc, cudarc falls back to
+    # its latest CUDA bindings and loads the driver and NVRTC when gmint runs.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      # This compiles every test, then runs only the ones that never touch a tensor backend.
+      # The others train a model, which needs `GMINT_TEST_DEVICE=cuda` and a GPU; without one
+      # they would train on the CPU. Add new host-only tests to this list.
+      - name: test (host-only)
+        run: 'cargo test --release --locked -- coder:: rans:: codec::tests::stream_order_inverts'
