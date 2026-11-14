@@ -996,8 +996,9 @@ impl Model {
             v.iter().filter(|x| x.abs() >= max).count() as f64 * 100.0 / v.len() as f64
         };
         let p = &self.p;
+        let (floor, blowups) = self.opt.floor();
         let mut out = format!(
-            "rate {}; pinned: emb {:.1}% pos {:.1}% wq {:.1}% wk {:.1}% wv {:.1}% w1 {:.1}% w2 {:.1}%",
+            "rate {} (floor {floor}, {blowups} windows over raw); pinned: emb {:.1}% pos {:.1}% wq {:.1}% wk {:.1}% wv {:.1}% w1 {:.1}% w2 {:.1}%",
             self.opt.rate(),
             pinned(&p.emb, SHADOW_EMB_MAX),
             pinned(&p.pos, SHADOW_EMB_MAX),

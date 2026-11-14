@@ -76,6 +76,8 @@ pub struct Optimizer {
     calm: u64,
     /// Windows since the last one that cost more than raw.
     quiet: u64,
+    /// Windows that cost more than raw, ever: each one raised the floor.
+    blowups: u64,
     /// Per group, the log2 offset of its gradient scale (see [`Self::step`]), as last given.
     offsets: Vec<i32>,
     /// The device copy of every group's plain SGD step, `[2 groups]` as (shift, up), and the
@@ -97,6 +99,7 @@ impl Optimizer {
             filled: 0,
             calm: 0,
             quiet: 0,
+            blowups: 0,
             offsets: vec![0; groups],
             steps: None,
         }
@@ -182,6 +185,7 @@ impl Optimizer {
             self.floor = self.lr_now - 1;
             self.calm = 0;
             self.quiet = 0;
+            self.blowups += 1;
         } else if worse {
             self.lr_now = (self.lr_now + 1).min(LR_MAX);
             self.calm = 0;
@@ -206,6 +210,12 @@ impl Optimizer {
     /// The rate [`Rule::Auto`] has settled on.
     pub fn rate(&self) -> i32 {
         self.lr_now
+    }
+
+    /// [`Rule::Auto`]'s current floor (the fastest rate it may return to) and how many windows
+    /// have cost more than raw so far, for the health line.
+    pub fn floor(&self) -> (i32, u64) {
+        (self.floor, self.blowups)
     }
 
     /// Call once per training step, before the groups are stepped.
