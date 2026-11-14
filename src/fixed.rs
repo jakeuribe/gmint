@@ -277,6 +277,21 @@ impl Head {
     }
 }
 
+/// 256 ln(p / 4096) for a Q12 probability p in 0..=4096 (p = 0 is cut to `-LOGIT_SPAN`), by
+/// inverting the exp table: the smallest d with exp(-d/256) <= p / 4096.
+fn log_table() -> Vec<i32> {
+    let exp = exp_lut();
+    let mut logp = vec![-LOGIT_SPAN; 4097];
+    let mut d = LOGIT_SPAN as usize;
+    for p in 1..=4096usize {
+        while d > 0 && (exp[d - 1] as i64) <= (p as i64) << 8 {
+            d -= 1;
+        }
+        logp[p] = -(d as i32);
+    }
+    logp
+}
+
 /// Constant tables of a tree head.
 struct Tree {
     /// Per level: the node each byte value passes through, `[VOCAB]`.
@@ -332,16 +347,7 @@ impl Tree {
         let right: Vec<i32> = bit_q12.iter().map(|b| b / 4096).collect();
         let left: Vec<i32> = on_path.iter().zip(&right).map(|(on, r)| on - r).collect();
         let (right_t, left_t) = (table(right.clone()).transpose(), table(left).transpose());
-        // ln by inverting the exp table: the smallest d with exp(-d/256) <= p / 4096
-        let exp = exp_lut();
-        let mut logp = vec![-LOGIT_SPAN; 4097];
-        let mut d = LOGIT_SPAN as usize;
-        for p in 1..=4096usize {
-            while d > 0 && (exp[d - 1] as i64) <= (p as i64) << 8 {
-                d -= 1;
-            }
-            logp[p] = -(d as i32);
-        }
+        let logp = log_table();
         // sigma(-x) = e^-x / (1 + e^-x), from the same integer exp table as the softmax
         let sigmoid: Vec<i32> = exp_lut().iter().map(|e| ((*e as i64 * 4096) / (LUT_ONE + *e as i64)) as i32).collect();
         Self {
@@ -509,6 +515,8 @@ pub struct Model {
     /// gradient when nothing trains it, `[3, 1]`.
     no_guess: Tensor<2, Int>,
     zero3: Tensor<2, Int>,
+    /// [`log_table`], for [`Model::pending_loss`] with a softmax head.
+    logp: Tensor<1, Int>,
     device: Device,
 }
 
@@ -617,7 +625,7 @@ impl Model {
         };
         let tree = (cfg.head != Head::Softmax).then(|| Tree::new(cfg.head == Head::RandomTree, cfg.seed, device));
         let lut = Tensor::from_data(TensorData::new(exp_lut(), [LOGIT_SPAN as usize + 1]), device);
-        Self { cfg, p, lut, below: below_table(device), eye: one_hot_rows(VOCAB, device), eye3: one_hot_rows(3, device), tree, opt: Optimizer::new(cfg.rule, cfg.lr, 8).with_offsets(&GROUP_OFFSETS), pending: None, last_hidden: None, norm: Norm::new(cfg.hid, device), no_guess: Tensor::zeros([cfg.batch, 2], device), zero3: Tensor::zeros([3, 1], device), device: device.clone() }
+        Self { cfg, p, lut, below: below_table(device), eye: one_hot_rows(VOCAB, device), eye3: one_hot_rows(3, device), tree, opt: Optimizer::new(cfg.rule, cfg.lr, 8).with_offsets(&GROUP_OFFSETS), pending: None, last_hidden: None, norm: Norm::new(cfg.hid, device), no_guess: Tensor::zeros([cfg.batch, 2], device), zero3: Tensor::zeros([3, 1], device), logp: Tensor::from_data(TensorData::new(log_table(), [4097]), device), device: device.clone() }
     }
 
     fn softmax<const D: usize>(&self, logits: Tensor<D, Int>) -> (Tensor<D, Int>, Tensor<D, Int>) {
@@ -1057,6 +1065,24 @@ impl Model {
 }
 
 impl Model {
+    /// The head's own loss on the pass just made, before the update: `-sum ln p` of the true
+    /// bytes under the head's distribution, in Q8 (256 ln) units, `[1]`. It is what the gradient
+    /// descends. The coder's code length differs from it by the match boost (applied after the
+    /// head; its gain trains on its own error) and by the coder's quantised frequencies (each
+    /// at least 1). Needs a preceding [`Predictor::predict_coded`]; read it before `learn`.
+    pub fn pending_loss(&self, target: &Tensor<1, Int>) -> Tensor<1, Int> {
+        let c = self.pending.as_ref().expect("pending_loss needs a forward pass");
+        let b = self.cfg.batch;
+        let picked = |t: Tensor<2, Int>| t.gather(1, target.clone().reshape([b, 1])).reshape([b]);
+        // per row at least -8 * 4095, so a batch of up to 2^15 rows sums inside i32
+        let log = match &self.tree {
+            // the sum of the branch logs down the byte's path
+            Some(tree) => picked(tree.log_scores(&c.prob)),
+            None => self.logp.clone().select(0, picked(c.prob.clone()).clamp(0, 4096)),
+        };
+        -log.sum()
+    }
+
     /// See [`Predictor::graphable`]: GPU kernels for the whole step under a plain SGD rule, and
     /// no running normalisation statistics (they are replaced, not updated in place).
     pub fn graphable(&self) -> bool {

@@ -255,24 +255,28 @@ fn main() {
             println!("{} samples, {bytes} bytes per epoch, {cfg:?}", samples.len());
             for epoch in 1..=epochs {
                 let t0 = std::time::Instant::now();
-                let (mut cost, mut seen) = (0u64, 0usize);
+                let (mut cost, mut seen) = (codec::PassCost::default(), 0usize);
                 for (n, sample) in samples.iter().enumerate() {
-                    cost += codec::train_pass(&mut model, sample, &dev);
-                    seen += sample.len() / cfg.batch * cfg.batch;
-                    // one line per sample, so a long epoch can be watched
+                    let this = codec::train_pass(&mut model, sample, &dev);
+                    cost.add(this);
+                    let here = sample.len() / cfg.batch * cfg.batch;
+                    seen += here;
+                    // one line per sample, so a long epoch can be watched: the coded bits and the
+                    // head's own loss, both measured before each step's update, over the epoch so
+                    // far and over this sample alone
+                    let ((coded, loss), (s_coded, s_loss)) = (cost.bits_per_byte(seen), this.bits_per_byte(here));
                     eprintln!(
-                        "  epoch {epoch} sample {}/{}: {:.4} bits/byte so far, rate {}, {:.0}s",
+                        "  epoch {epoch} sample {}/{}: {coded:.4} bits/byte so far (loss {loss:.4}); this sample {s_coded:.4} (loss {s_loss:.4}); rate {}, {:.0}s",
                         n + 1,
                         samples.len(),
-                        cost as f64 / 256.0 / seen.max(1) as f64,
                         model.rate(),
                         t0.elapsed().as_secs_f64()
                     );
                 }
+                let (coded, loss) = cost.bits_per_byte(bytes);
                 println!(
-                    "epoch {epoch}: {:.4} bits/byte (ratio {:.4}), {:.0}s, rate now {}",
-                    cost as f64 / 256.0 / bytes as f64,
-                    8.0 * 256.0 * bytes as f64 / cost as f64,
+                    "epoch {epoch}: {coded:.4} bits/byte (ratio {:.4}), loss {loss:.4} bits/byte, {:.0}s, rate now {}",
+                    8.0 / coded,
                     t0.elapsed().as_secs_f64(),
                     model.rate()
                 );

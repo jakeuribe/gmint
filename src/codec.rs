@@ -289,16 +289,39 @@ impl Deferred {
     }
 }
 
-/// One pass of online training over `data` with no coding, for building a prior. Returns the
-/// code length the model would have produced, in Q8 bits. Nothing is read back from the device
-/// except three numbers per stream, once every [`FLUSH`] steps.
-pub fn train_pass(model: &mut Model, data: &[u8], device: &Device) -> u64 {
+/// What a [`train_pass`] measured, both on each step's pass before its update.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PassCost {
+    /// The code length the coder would have produced, in Q8 bits.
+    pub coded_q8: u64,
+    /// The head's own loss, `-sum ln p` in Q8 natural-log units (see [`Model::pending_loss`]).
+    pub loss_q8: u64,
+}
+
+impl PassCost {
+    pub fn add(&mut self, o: PassCost) {
+        self.coded_q8 += o.coded_q8;
+        self.loss_q8 += o.loss_q8;
+    }
+
+    /// (coded, loss) in bits per byte over `bytes`.
+    pub fn bits_per_byte(&self, bytes: usize) -> (f64, f64) {
+        let n = bytes.max(1) as f64;
+        (self.coded_q8 as f64 / 256.0 / n, self.loss_q8 as f64 / 256.0 / std::f64::consts::LN_2 / n)
+    }
+}
+
+/// One pass of online training over `data` with no coding, for building a prior. Returns what
+/// coding would have cost and the head's own loss. Nothing is read back from the device except
+/// three numbers per stream and one per step, once every [`FLUSH`] steps.
+pub fn train_pass(model: &mut Model, data: &[u8], device: &Device) -> PassCost {
     let m = model.cfg;
     let len = data.len() / m.batch;
     let mut syms = vec![0i32; m.batch];
-    let mut total_cost = 0;
+    let mut total = PassCost::default();
     let mut matcher = Matcher::new(m.matcher, m.batch);
     let mut pending = Vec::with_capacity(FLUSH);
+    let mut losses = Vec::with_capacity(FLUSH);
     for t in 0..len {
         for (s, sym) in syms.iter_mut().enumerate() {
             *sym = data[s * len + t] as i32;
@@ -306,16 +329,19 @@ pub fn train_pass(model: &mut Model, data: &[u8], device: &Device) -> u64 {
         let guess = matcher.guesses(data, len, t, device);
         let target = targets(&syms, device);
         pending.push(model.predict_coded(contexts(data, len, t, &m, device), guess, target.clone()));
+        losses.push(model.pending_loss(&target));
         matcher.advance(data, len, t);
         model.learn(target);
         if pending.len() == FLUSH || t + 1 == len {
             drain(&mut pending, m.batch, |_| {}, |cost| {
                 model.observe(cost);
-                total_cost += cost;
+                total.coded_q8 += cost;
             });
+            let loss: Vec<i32> = Tensor::cat(std::mem::take(&mut losses), 0).into_data().convert::<i32>().try_to_vec().unwrap();
+            total.loss_q8 += loss.iter().map(|l| *l as u64).sum::<u64>();
         }
     }
-    total_cost
+    total
 }
 
 #[derive(Clone, Copy, Debug)]
