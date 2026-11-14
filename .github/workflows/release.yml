@@ -1,0 +1,35 @@
+name: release
+
+# Pushing a tag such as v0.1.0 builds gmint, attaches it to a draft release, and stops. Priors
+# are not in git: add them from your machine with scripts/add-prior.sh, check the draft on
+# GitHub, then publish it there.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # the same host-only tests as ci.yml
+      - name: test (host-only)
+        run: 'cargo test --release --locked -- coder:: rans:: codec::tests::stream_order_inverts'
+      - run: scripts/release.sh "$GITHUB_REF_NAME"
+      - name: draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "gmint $GITHUB_REF_NAME for x86-64 Linux, built on Ubuntu 24.04. It needs an NVIDIA GPU, its driver, and NVRTC (part of the CUDA toolkit)."
+            echo "Check the downloads with \`sha256sum -c SHA256SUMS\`."
+            echo
+            cat priors/README.md
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* --draft \
+            --title "gmint $GITHUB_REF_NAME" --notes-file notes.md

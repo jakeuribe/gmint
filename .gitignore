@@ -1,3 +1,7 @@
 /target
 /target-fusion
 /gmint
+/dist
+/priors/*
+!/priors/.gitkeep
+!/priors/README.md
