@@ -51,6 +51,8 @@ options:
   --lcr W[,W...]       latency weight of the update controller, 0..=256 (default 16)
   --prior FILE         start from pre-trained weights; the same file is needed to decompress
   --epochs N           passes over the samples when training (default 2)
+  --mix on|off         train on all the samples at once, so every batch mixes them, rather
+                       than one sample after another (default on)
   --limit BYTES        only use the first BYTES of the input
   --seed N";
 
@@ -254,19 +256,47 @@ fn main() {
                     d
                 })
                 .collect();
+            let count = samples.len();
+            // The streams of a training pass are contiguous slices of its data, so a pass per
+            // sample trains every batch on one sample: the auto rule then reads each switch to
+            // the next sample as the model getting worse and slows down for good, and the prior
+            // ends up tuned to the last sample. One pass over all of them joined end to end
+            // spreads every batch over all of them.
+            let mix = args.switch("mix", true);
+            let samples = if mix {
+                let mut all = Vec::with_capacity(samples.iter().map(Vec::len).sum());
+                samples.into_iter().for_each(|s| all.extend_from_slice(&s));
+                vec![all]
+            } else {
+                samples
+            };
             let bytes: usize = samples.iter().map(|s| s.len() / cfg.batch * cfg.batch).sum();
-            println!("{} samples, {bytes} bytes per epoch, {cfg:?}", samples.len());
+            println!("{count} samples{}, {bytes} bytes per epoch, {cfg:?}", if mix { " mixed" } else { "" });
             for epoch in 1..=epochs {
                 let t0 = std::time::Instant::now();
                 let (mut cost, mut seen) = (codec::PassCost::default(), 0usize);
                 for (n, sample) in samples.iter().enumerate() {
-                    let this = codec::train_pass(&mut model, sample, &dev);
+                    // in one long pass, a line at every tenth of it, so the epoch can be watched
+                    let (here, mut tenths) = (sample.len() / cfg.batch * cfg.batch, 1);
+                    let this = codec::train_pass(&mut model, sample, &dev, |done, so_far, rate| {
+                        if samples.len() == 1 && done < here && done * 10 >= here * tenths {
+                            tenths = done * 10 / here + 1;
+                            let (coded, loss) = so_far.bits_per_byte(done);
+                            eprintln!(
+                                "  epoch {epoch} at {}%: {coded:.4} bits/byte so far (loss {loss:.4}); rate {rate}, {:.0}s",
+                                done * 100 / here,
+                                t0.elapsed().as_secs_f64()
+                            );
+                        }
+                    });
                     cost.add(this);
-                    let here = sample.len() / cfg.batch * cfg.batch;
                     seen += here;
-                    // one line per sample, so a long epoch can be watched: the coded bits and the
-                    // head's own loss, both measured before each step's update, over the epoch so
-                    // far and over this sample alone
+                    if samples.len() == 1 {
+                        continue;
+                    }
+                    // otherwise a line per sample: the coded bits and the head's own loss, both
+                    // measured before each step's update, over the epoch so far and over this
+                    // sample alone
                     let ((coded, loss), (s_coded, s_loss)) = (cost.bits_per_byte(seen), this.bits_per_byte(here));
                     eprintln!(
                         "  epoch {epoch} sample {}/{}: {coded:.4} bits/byte so far (loss {loss:.4}); this sample {s_coded:.4} (loss {s_loss:.4}); rate {}, {:.0}s",

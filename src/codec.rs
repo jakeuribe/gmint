@@ -321,8 +321,9 @@ impl PassCost {
 
 /// One pass of online training over `data` with no coding, for building a prior. Returns what
 /// coding would have cost and the head's own loss. Nothing is read back from the device except
-/// three numbers per stream and one per step, once every [`FLUSH`] steps.
-pub fn train_pass(model: &mut Model, data: &[u8], device: &Device) -> PassCost {
+/// three numbers per stream and one per step, once every [`FLUSH`] steps; then `progress` is
+/// called with the bytes trained on so far, their cost, and the model's rate.
+pub fn train_pass(model: &mut Model, data: &[u8], device: &Device, mut progress: impl FnMut(usize, PassCost, i32)) -> PassCost {
     let m = model.cfg;
     let len = data.len() / m.batch;
     let mut syms = vec![0i32; m.batch];
@@ -347,6 +348,7 @@ pub fn train_pass(model: &mut Model, data: &[u8], device: &Device) -> PassCost {
             });
             let loss: Vec<i32> = Tensor::cat(std::mem::take(&mut losses), 0).into_data().convert::<i32>().try_to_vec().unwrap();
             total.loss_q8 += loss.iter().map(|l| *l as u64).sum::<u64>();
+            progress((t + 1) * m.batch, total, model.rate());
         }
     }
     total
@@ -935,7 +937,7 @@ mod tests {
         let mut o = options(Rule::Auto, 0);
         (o.model.norm, o.model.mask) = (norm, mask);
         let mut model = Model::new(o.model, &device);
-        train_pass(&mut model, &sample(60_000), &device);
+        train_pass(&mut model, &sample(60_000), &device, |_, _, _| {});
         let bytes = Prior::encode(&o.model, &model.export());
         let dir = std::env::temp_dir().join(format!("gmint-prior-test-{}", std::process::id()));
         std::fs::write(&dir, &bytes).unwrap();
