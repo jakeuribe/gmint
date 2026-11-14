@@ -1,67 +1,60 @@
 # gmint
 
-General-minification lossless transformer: a lossless compressor whose model learns each file
-while coding it. It needs no pre-training and stores no weights in its output.
+gmint (general-minification lossless transformer) is a lossless compressor. A small neural
+network predicts each next byte, and the better it predicts, the fewer bits the byte costs. The
+network starts untrained and learns each file while coding it, so the output holds no weights.
+
+It does not yet compress as well as xz or zstd (see Results).
 
 ## How it works
 
-- A small attention model [1] predicts each next byte. A random sum-product network [2] can
-  replace it or join it, and a match finder (`--match on`) proposes bytes from earlier repeats.
-- After coding each step, the model trains on it. The decoder repeats that training as it
-  decodes, so both sides hold the same model at every step.
-- Integer-only arithmetic keeps encoder and decoder identical, bit for bit, on any backend.
-- The input is split into 512 streams coded in parallel. Streams take 4096-byte blocks in
-  turn, so the match finder sees almost all earlier input.
-- Each stream has its own rANS state [3], and all states share one stream of words [4], so the
-  GPU decodes a whole step at once. With `--lcr 0` every step replays as one CUDA graph, and
-  decoding runs as fast as encoding.
-- `--lcr` skips training on steps that already code well, after TRACE [5].
-- `gmint train` makes a prior (pre-trained starting weights). Its hash goes in the header, and
-  decompressing needs it too.
+- The input is dealt out in 4096-byte blocks to 512 streams. Each step codes one byte of every
+  stream.
+- The network is a small transformer [1] (`--model spn` swaps in a random sum-product
+  network [2]). `--match on` adds a match finder, which proposes the byte that followed the last
+  occurrence of the preceding 8 (or 5) bytes.
+- After each step the network trains on the bytes just coded. The decoder repeats the same
+  predictions and training, so both networks stay identical. All arithmetic is integer, because
+  floating-point rounding can differ between devices.
+- The entropy coder is rANS [3]: one coder state per stream, all writing into one sequence of
+  words [4], so the GPU decodes each step without a round trip to the CPU. With `--lcr 0`,
+  each step's GPU work is recorded once and replayed (a CUDA graph).
+- `--lcr W` (default 16) skips training on steps cheaper than W/256 of the recent average,
+  trading ratio for time, after TRACE [5]; 0 never skips.
+- `gmint train` makes a prior: starting weights trained on sample files. The decoder needs the
+  same prior and checks its hash.
 
-Files in the older range-coded format [6] still decode.
-
-## Requirements
-
-Rust 1.98 or later and an NVIDIA GPU with CUDA. The CPU backend (`--device flex`) is far too
-slow for real use.
+Older range-coded files [6] still decode.
 
 ## Build and use
+
+Needs an NVIDIA GPU with CUDA. Tested with Rust 1.98.
 
     cargo build --release
     target/release/gmint c in out.gm --lcr 0     # compress
     target/release/gmint d out.gm in             # decompress
-    target/release/gmint dry in                  # ratio, speed, model health; writes nothing
-    target/release/gmint train out.prior a b ... # pre-train a prior
+    target/release/gmint train out.prior a b ... # train a prior on files a, b
+    GMINT_TEST_DEVICE=cuda cargo test --release  # run the tests on the GPU
 
-`gmint` alone lists every option. Settings go into the file header, so `d` needs only the
-`--prior` used, if any.
+`gmint` alone lists every option; `d` reads its settings from the file.
 
-Best settings so far:
-
-- No prior: `--batch 512 --lcr 0 --head tree --match on --short 2 --warm 1024`
-- With a prior: `--prior FILE --lr 15 --seed 42 --block 2048`
+Best settings so far: `--lcr 0 --head tree --match on --short 2 --warm 1024`
+without a prior; `--prior FILE --lr 15 --seed 42 --block 2048` with one.
 
 ## Results
 
-Ratio (original / compressed, higher is better) on six 4 MiB files the prior never saw: a slice
-of Zotero's `libxul.so` and five slices of a tar of its install.
+Ratio (original / compressed; higher is better) on six 4 MiB slices of Zotero's install: xul
+from `libxul.so`, the rest from a tar of it. The prior was trained on other apps' files.
 
-|                 | xul   | zot   | z60   | z90   | z120  | z160  | total |
-|-----------------|-------|-------|-------|-------|-------|-------|-------|
-| xz -9e          | 5.347 | 2.578 | 3.972 | 3.577 | 2.687 | 2.979 | 3.308 |
-| zstd -19 --long | 4.537 | 2.001 | 3.658 | 3.391 | 2.540 | 2.765 | 2.936 |
-| gmint, no prior | 4.451 | 2.199 | 2.964 | 2.785 | 2.192 | 2.248 | 2.635 |
-| gmint, prior    | 3.874 | 2.009 | 2.980 | 2.738 | 2.319 | 2.293 | 2.582 |
+compressor      | xul   | zot   | z60   | z90   | z120  | z160  | total
+----------------|-------|-------|-------|-------|-------|-------|------
+xz -9e          | 5.347 | 2.578 | 3.972 | 3.577 | 2.687 | 2.979 | 3.308
+zstd -19 --long | 4.537 | 2.001 | 3.658 | 3.391 | 2.540 | 2.765 | 2.936
+gmint, no prior | 4.451 | 2.199 | 2.964 | 2.785 | 2.192 | 2.248 | 2.635
+gmint, prior    | 3.874 | 2.009 | 2.980 | 2.738 | 2.319 | 2.293 | 2.582
 
-gmint does not beat xz yet, and beats zstd on one file (zot). It codes at about 1.3–1.6 MiB/s
-each way on an RTX 5070 with `--lcr 0`.
-
-## Tests
-
-    GMINT_TEST_DEVICE=cuda cargo test --release
-
-Without it, tests run on the slow CPU backend.
+gmint beats zstd only on zot. On an RTX 5070, a 32 MiB file took 20.6 s to compress and 19.8 s
+to decompress (`--lcr 0`).
 
 ## Sources
 
