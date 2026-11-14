@@ -1,22 +1,35 @@
 //! File format and the online coding loop.
 //!
-//! The input is cut into `batch` equal streams. Each step predicts one byte of every stream from
-//! that stream's previous `ctx` bytes, codes the batch, then trains on it. The decoder runs the
-//! same model on the bytes it has already recovered, so nothing but the coded bytes is stored.
-//! The remainder that does not fill a step is stored raw.
+//! The input is cut into `batch` equal streams, each taking it round-robin in blocks (see
+//! [`to_streams`]). Each step predicts one byte of every stream from that stream's previous
+//! `ctx` bytes, codes the batch, then trains on it. The decoder runs the same model on the bytes
+//! it has already recovered, so nothing but the coded bytes is stored. The remainder that does
+//! not fill a step is stored raw.
+//!
+//! Every stream has its own rANS coder state ([`crate::rans`]), so a step's bytes are decoded
+//! all at once, on the GPU: the decoder no longer reads 256 frequencies per stream back to the
+//! host and walks the streams one by one. Files from before (`GMINT1`, one range coder over every
+//! stream in turn) still decode.
 
 use std::collections::VecDeque;
 use std::time::Instant;
 
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
-use crate::coder::{Decoder, Encoder};
+use crate::coder::Decoder as RangeDecoder;
+use crate::rans::{Decoder, Encoder};
 use crate::fixed::{Arch, Config, Head, Model, Predictor, VOCAB};
 use crate::mix::Mix;
 use crate::optim::Rule;
 
-const MAGIC: &[u8; 6] = b"GMINT1";
-const HEADER_LEN: usize = 6 + 8 + 4 + 2 + 2 + 2 + 1 + 2 + 8 + 8 + 1 + 8 + 1 + 1 + 1 + 2 + 1 + 1 + 2 + 1;
+/// Files coded with the interleaved rANS coder ([`crate::rans`]).
+const MAGIC: &[u8; 6] = b"GMINT2";
+/// Files from before it: one range coder ([`crate::coder`]) over every stream in turn. They
+/// still decode; nothing writes them any more.
+const MAGIC_RANGE: &[u8; 6] = b"GMINT1";
+/// The range coder's header; the rANS format's adds the block size (see [`Options::block`]).
+const HEADER_LEN_RANGE: usize = 6 + 8 + 4 + 2 + 2 + 2 + 1 + 2 + 8 + 8 + 1 + 8 + 1 + 1 + 1 + 2 + 1 + 1 + 2 + 1;
+const HEADER_LEN: usize = HEADER_LEN_RANGE + 4;
 const PRIOR_MAGIC: &[u8; 8] = b"GMPRIOR1";
 /// Steps of history the update controller averages over.
 const WINDOW: usize = 32;
@@ -31,40 +44,100 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// log2(x) in Q8 from integer ops only: exponent plus a linear mantissa. Within 0.09 bits of the
 /// true value, which is enough for the controller and identical on every machine.
-fn log2_q8(x: u64) -> u64 {
+pub(crate) fn log2_q8(x: u64) -> u64 {
     let n = 63 - x.leading_zeros() as u64;
     let m = if n >= 8 { (x >> (n - 8)) & 0xFF } else { (x << (8 - n)) & 0xFF };
     (n << 8) | m
 }
 
-/// Bytes of context a match must share before it is proposed.
-const MATCH_MIN: usize = 6;
+/// Bytes of context a short match must share before it is proposed; a long one needs
+/// [`MATCH_LONG_CONTEXT`] and is preferred.
+const MATCH_MIN: usize = 5;
+const MATCH_LONG_CONTEXT: usize = 8;
 /// Matches at least this long are reported at the higher trust level.
 const MATCH_LONG: u32 = 16;
 const MATCH_TABLE_LOG2: u32 = 22;
 const NO_MATCH: usize = usize::MAX;
 
+/// How the match finder looks for and follows matches; the default is how files are coded.
+///
+/// Measured 2026-11-13 against the earlier finder (one 6-byte context, unverified, indexed as it
+/// looked up; [`MatchStyle::earlier`]): smaller on all 14 file and config pairs tried, by 3.2% on
+/// average without a prior (kc32 6.0%) and 1.9% with the best prior. One minimum length cannot
+/// serve both kinds of file: very repetitive ones want only long, reliable matches, binaries gain
+/// from short ones; preferring a verified long match and falling back to a short one does both.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MatchStyle {
+    /// Bytes of context a match must share before it is proposed.
+    pub min: usize,
+    /// Look every stream's context up before indexing any of the step's: otherwise a stream can
+    /// find a context another stream indexed this very step, whose next byte is not coded yet,
+    /// and lose the step.
+    pub lookup_first: bool,
+    /// Check a found context really is the stream's own, so a hash collision is not proposed.
+    pub verify: bool,
+    /// With a block layout ([`to_streams`]), follow a match from a block's last byte to the
+    /// first byte of the next block of the input, not of the stream.
+    pub follow_blocks: bool,
+    /// A second, longer context (0 for none): looked up first, always verified, so a long
+    /// reliable match is preferred and the short one is only the fallback.
+    pub long: usize,
+    /// Count a match's run from the length of the context it was found by, not from 0.
+    pub run_from_context: bool,
+}
+
+impl Default for MatchStyle {
+    fn default() -> Self {
+        Self { min: MATCH_MIN, lookup_first: true, verify: true, follow_blocks: true, long: MATCH_LONG_CONTEXT, run_from_context: true }
+    }
+}
+
+impl MatchStyle {
+    /// The finder before 2026-11-13, for comparisons ([`Matcher::census`]).
+    pub fn earlier() -> Self {
+        Self { min: 6, lookup_first: false, verify: false, follow_blocks: false, long: 0, run_from_context: false }
+    }
+}
+
 /// Long-range match finder: the model itself only sees the last few bytes, so this proposes the
-/// byte that followed the most recent earlier occurrence of the current [`MATCH_MIN`]-byte
+/// byte that followed the most recent earlier occurrence of the current [`MatchStyle::min`]-byte
 /// context, anywhere in what has been coded so far. It reads only bytes from completed steps,
 /// which the decoder also has, and uses no floats, so both sides propose the same bytes.
 pub struct Matcher {
     on: bool,
+    style: MatchStyle,
+    /// The block size of the stream order, 0 for none (see [`MatchStyle::follow_blocks`]).
+    block: usize,
     /// Hash of a context to the position after it, plus one; 0 is empty.
     table: Vec<u64>,
     /// Per stream: where the byte now being proposed is read from, and how long the match has run.
     from: Vec<usize>,
     run: Vec<u32>,
+    /// With [`MatchStyle::lookup_first`]: each stream's slot for the step being recorded.
+    slots: Vec<usize>,
+    /// With [`MatchStyle::long`]: the long contexts' table, and each stream's slot in it.
+    long_table: Vec<u64>,
+    long_slots: Vec<usize>,
 }
 
 impl Matcher {
-    pub fn new(on: bool, batch: usize) -> Self {
+    pub fn new(on: bool, batch: usize, block: usize) -> Self {
+        Self::styled(on, batch, MatchStyle::default(), block)
+    }
+
+    pub fn styled(on: bool, batch: usize, style: MatchStyle, block: usize) -> Self {
         let table = if on { vec![0; 1 << MATCH_TABLE_LOG2] } else { Vec::new() };
-        Self { on, table, from: vec![NO_MATCH; batch], run: vec![0; batch] }
+        let long_table = if on && style.long > 0 { vec![0; 1 << MATCH_TABLE_LOG2] } else { Vec::new() };
+        Self { on, style, block, table, from: vec![NO_MATCH; batch], run: vec![0; batch], slots: vec![0; batch], long_table, long_slots: vec![0; batch] }
     }
 
     fn slot(context: &[u8]) -> usize {
-        let key = context.iter().fold(0u64, |k, b| (k << 8) | *b as u64);
+        let key = if context.len() <= 8 {
+            context.iter().fold(0u64, |k, b| (k << 8) | *b as u64)
+        } else {
+            // longer than a word: every byte through the hash, not just the last eight
+            context.iter().fold(0xcbf2_9ce4_8422_2325u64, |k, b| (k ^ *b as u64).wrapping_mul(0x100_0000_01b3))
+        };
         (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - MATCH_TABLE_LOG2)) as usize
     }
 
@@ -93,31 +166,108 @@ impl Matcher {
         out
     }
 
+    /// The position after `c` in input order: `c + 1`, except across a block's end when
+    /// following blocks.
+    fn after(&self, c: usize, len: usize) -> usize {
+        let b = self.block;
+        if !self.style.follow_blocks || b == 0 || b >= len || len % b != 0 || (c % len) % b != b - 1 {
+            return c + 1;
+        }
+        let (s, row) = (c / len, (c % len) / b);
+        let batch = self.from.len();
+        if s + 1 < batch { (s + 1) * len + row * b } else { (row + 1) * b }
+    }
+
+    /// Whether the `min` bytes ending at `pos` are a context of the input, not a join of blocks.
+    fn whole_context(&self, pos: usize, len: usize, min: usize) -> bool {
+        let b = self.block;
+        !self.style.follow_blocks || b == 0 || b >= len || len % b != 0 || (pos % len) % b + 1 >= min
+    }
+
     /// Records step `t` once its bytes are known: extends or drops each stream's match and
     /// indexes the contexts that now end at this step.
     pub fn advance(&mut self, data: &[u8], len: usize, t: usize) {
         if !self.on {
             return;
         }
-        for s in 0..self.from.len() {
+        let min = self.style.min;
+        let batch = self.from.len();
+        for s in 0..batch {
             let pos = s * len + t;
             if self.from[s] != NO_MATCH {
                 if data[self.from[s]] == data[pos] {
-                    self.from[s] += 1;
+                    self.from[s] = self.after(self.from[s], len);
                     self.run[s] += 1;
                 } else {
                     self.from[s] = NO_MATCH;
                 }
             }
-            if t + 1 >= MATCH_MIN {
-                // Look the context up before indexing it, or it would only ever find itself.
-                let slot = Self::slot(&data[pos + 1 - MATCH_MIN..=pos]);
-                if self.from[s] == NO_MATCH && self.table[slot] != 0 {
-                    (self.from[s], self.run[s]) = (self.table[slot] as usize - 1, 0);
+            // the long context first: a verified long match beats any short one
+            let long = self.style.long;
+            self.long_slots[s] = usize::MAX;
+            if long > 0 && t + 1 >= long && self.whole_context(pos, len, long) {
+                let slot = Self::slot(&data[pos + 1 - long..=pos]);
+                self.long_slots[s] = slot;
+                if self.from[s] == NO_MATCH && self.long_table[slot] != 0 {
+                    let c = self.long_table[slot] as usize - 1;
+                    if c >= long && data[c - long..c] == data[pos + 1 - long..=pos] {
+                        (self.from[s], self.run[s]) = (c, if self.style.run_from_context { long as u32 } else { 0 });
+                    }
                 }
+                if !self.style.lookup_first {
+                    self.long_table[slot] = pos as u64 + 2;
+                }
+            }
+            if t + 1 < min || !self.whole_context(pos, len, min) {
+                self.slots[s] = usize::MAX;
+                continue;
+            }
+            // Look the context up before indexing it, or it would only ever find itself.
+            let slot = Self::slot(&data[pos + 1 - min..=pos]);
+            self.slots[s] = slot;
+            if self.from[s] == NO_MATCH && self.table[slot] != 0 {
+                let c = self.table[slot] as usize - 1;
+                // the context before the candidate must be this one (it is coded: c - 1 was)
+                let same = !self.style.verify || (c >= min && data[c - min..c] == data[pos + 1 - min..=pos]);
+                if same {
+                    (self.from[s], self.run[s]) = (c, if self.style.run_from_context { min as u32 } else { 0 });
+                }
+            }
+            if !self.style.lookup_first {
                 self.table[slot] = pos as u64 + 2;
             }
         }
+        if self.style.lookup_first {
+            for s in 0..batch {
+                let pos = (s * len + t) as u64 + 2;
+                if self.slots[s] != usize::MAX {
+                    self.table[self.slots[s]] = pos;
+                }
+                if self.long_slots[s] != usize::MAX {
+                    self.long_table[self.long_slots[s]] = pos;
+                }
+            }
+        }
+    }
+
+    /// Proposals made and how many were right, per trust level (1, 2), over a stream order: what
+    /// the match finder alone would do on `data`, for comparing styles without a model.
+    pub fn census(data: &[u8], batch: usize, style: MatchStyle, block: usize) -> [(u64, u64); 2] {
+        let len = data.len() / batch;
+        let mut m = Self::styled(true, batch, style, block);
+        let mut out = [(0u64, 0u64); 2];
+        for t in 0..len {
+            let g = m.guess_values(data, len, t);
+            for s in 0..batch {
+                let level = g[s * 2 + 1] as usize;
+                if level > 0 {
+                    out[level - 1].0 += 1;
+                    out[level - 1].1 += (g[s * 2] == data[s * len + t] as i32) as u64;
+                }
+            }
+            m.advance(data, len, t);
+        }
+        out
     }
 }
 
@@ -246,20 +396,24 @@ fn replay(model: &mut dyn Predictor, data: &[u8], len: usize, upto: usize, m: &C
     }
 }
 
-/// Costs of a run of steps from their `(cum, freq, total)` rows, read back in one go: calls
-/// `each(step, row)` for every stream of every step, in coding order, then `after(cost)` per step.
+/// Values per stream and step in the rows the encoder reads back: the cost frequencies'
+/// (cum, freq, total), then the coder's (cum, freq); see [`crate::fixed::coded`].
+const ROW: usize = 5;
+
+/// Costs of a run of steps from their rows, read back in one go: calls `each(row)` for every
+/// stream of every step, in coding order, then `after(cost)` per step.
 fn drain(pending: &mut Vec<Tensor<2, Int>>, batch: usize, mut each: impl FnMut(&[i32]), mut after: impl FnMut(u64)) {
     if pending.is_empty() {
         return;
     }
     let rows = read_rows(pending);
-    for step in rows.chunks_exact(batch * 3) {
-        step.chunks_exact(3).for_each(&mut each);
+    for step in rows.chunks_exact(batch * ROW) {
+        step.chunks_exact(ROW).for_each(&mut each);
         after(step_cost(step));
     }
 }
 
-/// The `(cum, freq, total)` rows of a run of steps, read back in one go; empties `pending`.
+/// The rows of a run of steps (see [`ROW`]), read back in one go; empties `pending`.
 fn read_rows(pending: &mut Vec<Tensor<2, Int>>) -> Vec<i32> {
     let mut parts = std::mem::take(pending);
     let joined = if parts.len() == 1 { parts.pop().unwrap() } else { Tensor::cat(parts, 0) };
@@ -270,9 +424,10 @@ fn read_rows(pending: &mut Vec<Tensor<2, Int>>) -> Vec<i32> {
     }
 }
 
-/// One step's code length in Q8 bits, from its rows.
+/// One step's code length in Q8 bits, from its rows, in the cost frequencies: what the update
+/// controller and the auto rule steer by.
 fn step_cost(step: &[i32]) -> u64 {
-    step.chunks_exact(3).map(|row| log2_q8(row[2] as u64) - log2_q8(row[1] as u64)).sum()
+    step.chunks_exact(ROW).map(|row| log2_q8(row[2] as u64) - log2_q8(row[1] as u64)).sum()
 }
 
 /// A window whose rows were read back, and whose costs the model has seen, but which is not yet
@@ -285,10 +440,10 @@ impl Deferred {
     fn finish(self, enc: &mut Encoder, stats: &mut Stats, batch: usize, len: usize) {
         let Deferred(start, rows) = self;
         let before = enc.len();
-        for row in rows.chunks_exact(3) {
-            enc.encode(row[0] as u64, row[1] as u64, row[2] as u64);
+        for row in rows.chunks_exact(ROW) {
+            enc.push(row[3] as u32, row[4] as u32);
         }
-        let steps = rows.len() / (batch * 3);
+        let steps = rows.len() / (batch * ROW);
         for step in start..start + steps {
             if len >= 10 && (step + 1) % (len / 10) == 0 {
                 stats.curve.push(((step + 1) * batch, if step + 1 == start + steps { enc.len() } else { before }));
@@ -323,12 +478,13 @@ impl PassCost {
 /// coding would have cost and the head's own loss. Nothing is read back from the device except
 /// three numbers per stream and one per step, once every [`FLUSH`] steps; then `progress` is
 /// called with the bytes trained on so far, their cost, and the model's rate.
-pub fn train_pass(model: &mut Model, data: &[u8], device: &Device, mut progress: impl FnMut(usize, PassCost, i32)) -> PassCost {
+/// `data` is in stream order already, with blocks of `block` bytes (see [`to_streams`]).
+pub fn train_pass(model: &mut Model, data: &[u8], block: usize, device: &Device, mut progress: impl FnMut(usize, PassCost, i32)) -> PassCost {
     let m = model.cfg;
     let len = data.len() / m.batch;
     let mut syms = vec![0i32; m.batch];
     let mut total = PassCost::default();
-    let mut matcher = Matcher::new(m.matcher, m.batch);
+    let mut matcher = Matcher::new(m.matcher, m.batch, block);
     let mut pending = Vec::with_capacity(FLUSH);
     let mut losses = Vec::with_capacity(FLUSH);
     for t in 0..len {
@@ -359,6 +515,52 @@ pub struct Options {
     pub model: Config,
     /// Latency weight for the update controller, 0..=256.
     pub lcr_weight: u16,
+    /// How the streams take the input: 0 for one contiguous slice each, else round-robin in
+    /// blocks of this many bytes (see [`to_streams`]).
+    pub block: u32,
+}
+
+/// The input in the order the streams code it. Every stream codes a contiguous run of
+/// `len = n / batch` bytes of the result, and after step `t` the first `t` of every run are known
+/// to both sides; what the match finder can copy from is limited to those.
+///
+/// With `block = 0` each stream's run is a contiguous slice of the input, so at step `t` the
+/// known bytes are `t` from every slice, scattered over the whole input. With blocks, stream `s`
+/// takes input blocks `s`, `s + batch`, `s + 2 batch`, ...: then everything before the current
+/// row of blocks is already known, almost all of what precedes a position in the input. Blocks
+/// too small cost more than they win (a block's first bytes see the previous block's end as
+/// their context, and matches break at block ends); 2-4 KiB measured best.
+///
+/// When `block` does not divide `len`, each stream takes its whole blocks, then its own share of
+/// what is left; the tail past `batch * len` stays where it is.
+pub(crate) fn to_streams(data: &[u8], batch: usize, block: usize) -> Vec<u8> {
+    let mut out = data.to_vec();
+    for_blocks(data.len(), batch, block, |from, to, n| out[to..to + n].copy_from_slice(&data[from..from + n]));
+    out
+}
+
+/// The inverse of [`to_streams`].
+fn from_streams(coded: &[u8], batch: usize, block: usize) -> Vec<u8> {
+    let mut out = coded.to_vec();
+    for_blocks(coded.len(), batch, block, |from, to, n| out[from..from + n].copy_from_slice(&coded[to..to + n]));
+    out
+}
+
+/// Calls `each(input offset, stream-order offset, length)` for every piece [`to_streams`] moves.
+fn for_blocks(n: usize, batch: usize, block: usize, mut each: impl FnMut(usize, usize, usize)) {
+    let len = n / batch;
+    if block == 0 || block >= len {
+        return;
+    }
+    let (rows, rest) = (len / block, len % block);
+    for s in 0..batch {
+        for j in 0..rows {
+            each((j * batch + s) * block, s * len + j * block, block);
+        }
+        if rest > 0 {
+            each(batch * rows * block + s * rest, s * len + rows * block, rest);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -394,13 +596,20 @@ fn header(n: u64, o: &Options, checksum: u64, prior_hash: u64) -> Vec<u8> {
     h.extend((m.warm as u16).to_le_bytes());
     // bit 0 the normalised layer, bit 1 the mask; files from before the mask have it clear
     h.push(m.norm as u8 | (m.mask as u8) << 1);
+    h.extend(o.block.to_le_bytes());
     h
 }
 
-fn parse_header(b: &[u8]) -> Result<(u64, Options, u64, u64), String> {
-    if b.len() < HEADER_LEN || &b[..6] != MAGIC {
+/// The header's fields, and whether the file is in the rANS format (else the old range coder's).
+fn parse_header(b: &[u8]) -> Result<(u64, Options, u64, u64, bool), String> {
+    if b.len() < HEADER_LEN_RANGE || (&b[..6] != MAGIC && &b[..6] != MAGIC_RANGE) {
         return Err("not a gmint file".into());
     }
+    let rans = &b[..6] == MAGIC;
+    if rans && b.len() < HEADER_LEN {
+        return Err("not a gmint file".into());
+    }
+    let block = if rans { u32::from_le_bytes(b[HEADER_LEN_RANGE..HEADER_LEN].try_into().unwrap()) } else { 0 };
     let u16_at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
     let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
     let model = Config {
@@ -426,7 +635,7 @@ fn parse_header(b: &[u8]) -> Result<(u64, Options, u64, u64), String> {
         return Err("unknown model flags".into());
     }
     model.validate()?;
-    Ok((u64_at(6), Options { model, lcr_weight: u16_at(25) }, u64_at(35), u64_at(44)))
+    Ok((u64_at(6), Options { model, lcr_weight: u16_at(25), block }, u64_at(35), u64_at(44), rans))
 }
 
 /// Context tensor for step `t`: the `ctx` bytes before position `t` of every stream, zero before
@@ -480,9 +689,10 @@ struct Slots {
 }
 
 impl Slots {
-    fn new(m: &Config, device: &Device) -> Self {
+    /// Slots for `steps` steps.
+    fn new(m: &Config, steps: usize, device: &Device) -> Self {
         let flat = |n: usize| Tensor::<1, Int>::from_data(TensorData::new(vec![0i32; n], [n]), device);
-        Self { ctx: flat(FLUSH * m.batch * m.ctx), guess: flat(FLUSH * m.batch * 2), target: flat(FLUSH * m.batch), batch: m.batch, width: m.ctx }
+        Self { ctx: flat(steps * m.batch * m.ctx), guess: flat(steps * m.batch * 2), target: flat(steps * m.batch), batch: m.batch, width: m.ctx }
     }
 
     /// Step `i`'s inputs, as views of the slots.
@@ -505,12 +715,14 @@ pub fn compress(data: &[u8], o: &Options, prior: Option<&Prior>, device: &Device
 }
 
 /// [`compress`], optionally recording the predictor's health at every tenth of the input.
-pub fn compress_watched(data: &[u8], o: &Options, prior: Option<&Prior>, device: &Device, progress: bool, health: bool) -> Result<(Vec<u8>, Stats), String> {
+pub fn compress_watched(input: &[u8], o: &Options, prior: Option<&Prior>, device: &Device, progress: bool, health: bool) -> Result<(Vec<u8>, Stats), String> {
     let m = o.model;
+    let ordered = to_streams(input, m.batch, o.block as usize);
+    let data = &ordered[..];
     let len = data.len() / m.batch;
     let mut model = build(m, prior, device)?;
     let mut ctl = Controller::new(o.lcr_weight);
-    let mut enc = Encoder::new();
+    let mut enc = Encoder::new(m.batch);
     let mut stats = Stats::default();
     let (t0, mut last_print) = (Instant::now(), Instant::now());
     // Every step's inputs depend on the data alone, never on the model, so a second thread
@@ -518,7 +730,7 @@ pub fn compress_watched(data: &[u8], o: &Options, prior: Option<&Prior>, device:
     std::thread::scope(|scope| -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<StepInputs>(4 * FLUSH);
     scope.spawn(move || {
-        let mut matcher = Matcher::new(m.matcher, m.batch);
+        let mut matcher = Matcher::new(m.matcher, m.batch, o.block as usize);
         for t in 0..len {
             let guess = matcher.guess_values(data, len, t);
             let mut ctx = Vec::with_capacity(m.batch * m.ctx);
@@ -549,7 +761,7 @@ pub fn compress_watched(data: &[u8], o: &Options, prior: Option<&Prior>, device:
     } else {
         Graphing::Off
     };
-    let slots = (graphing != Graphing::Off).then(|| Slots::new(&m, device));
+    let slots = (graphing != Graphing::Off).then(|| Slots::new(&m, FLUSH, device));
     let mut captured: Vec<Tensor<2, Int>> = Vec::new();
     let mut deferred: Option<Deferred> = None;
     let mut t = 0;
@@ -625,7 +837,7 @@ pub fn compress_watched(data: &[u8], o: &Options, prior: Option<&Prior>, device:
                 d.finish(&mut enc, &mut stats, m.batch, len);
             }
             let rows = read_rows(&mut outputs);
-            for step in rows.chunks_exact(m.batch * 3) {
+            for step in rows.chunks_exact(m.batch * ROW) {
                 model.observe(step_cost(step));
             }
             deferred = Some(Deferred(t, rows));
@@ -662,7 +874,7 @@ pub fn compress_watched(data: &[u8], o: &Options, prior: Option<&Prior>, device:
         let forward_done = lap(profile, device, host_done, &mut phases[1]);
         let mut step_cost = 0;
         if flush == 1 {
-            drain(&mut pending, m.batch, |row| enc.encode(row[0] as u64, row[1] as u64, row[2] as u64), |cost| step_cost = cost);
+            drain(&mut pending, m.batch, |row| enc.push(row[3] as u32, row[4] as u32), |cost| step_cost = cost);
         }
         if flush > 1 || ctl.should_update(step_cost) {
             model.learn(target);
@@ -672,7 +884,7 @@ pub fn compress_watched(data: &[u8], o: &Options, prior: Option<&Prior>, device:
         if flush == 1 {
             model.observe(step_cost);
         } else if pending.len() == flush || t + 1 == len {
-            drain(&mut pending, m.batch, |row| enc.encode(row[0] as u64, row[1] as u64, row[2] as u64), |cost| model.observe(cost));
+            drain(&mut pending, m.batch, |row| enc.push(row[3] as u32, row[4] as u32), |cost| model.observe(cost));
         }
         crate::ops::prof::lap(device, "b: norm stats, rest");
         lap(profile, device, learn_done, &mut phases[3]);
@@ -683,7 +895,7 @@ pub fn compress_watched(data: &[u8], o: &Options, prior: Option<&Prior>, device:
         // after the flush above, so the rate the replay trains at is the one the decoder has
         if t + 1 == m.warm {
             if !pending.is_empty() {
-                drain(&mut pending, m.batch, |row| enc.encode(row[0] as u64, row[1] as u64, row[2] as u64), |cost| model.observe(cost));
+                drain(&mut pending, m.batch, |row| enc.push(row[3] as u32, row[4] as u32), |cost| model.observe(cost));
             }
             replay(model.as_mut(), data, len, m.warm, &m, device);
         }
@@ -723,15 +935,65 @@ pub fn compress_watched(data: &[u8], o: &Options, prior: Option<&Prior>, device:
     Ok(())
     })?;
 
-    let mut out = header(data.len() as u64, o, fnv1a(data), prior.map_or(0, |p| p.hash));
+    let mut out = header(data.len() as u64, o, fnv1a(input), prior.map_or(0, |p| p.hash));
     out.extend(enc.finish());
     out.extend(&data[len * m.batch..]);
     stats.seconds = t0.elapsed().as_secs_f64();
     Ok((out, stats))
 }
 
+/// The rANS decoder's state on the GPU: the lane states, the coded words, the read position.
+struct GpuLanes {
+    x: Tensor<1, Int>,
+    words: Tensor<1, Int>,
+    at: Tensor<1, Int>,
+}
+
+impl GpuLanes {
+    fn new(coded: &[u8], lanes: usize, device: &Device) -> Self {
+        let dec = Decoder::new(coded, lanes);
+        let x: Vec<i32> = dec.x.iter().flat_map(|s| [*s as u32 as i32, (*s >> 32) as u32 as i32]).collect();
+        let tail = coded.get(8 * lanes..).unwrap_or(&[]);
+        let mut words: Vec<i32> = tail.chunks(4).map(|c| {
+            let mut b = [0u8; 4];
+            b[..c.len()].copy_from_slice(c);
+            i32::from_le_bytes(b)
+        }).collect();
+        // an empty buffer is not a tensor; a zero word reads like the end of the stream
+        if words.is_empty() {
+            words.push(0);
+        }
+        let n = words.len();
+        Self {
+            x: Tensor::from_data(TensorData::new(x, [2 * lanes]), device),
+            words: Tensor::from_data(TensorData::new(words, [n]), device),
+            at: Tensor::from_data(TensorData::new(vec![0i32], [1]), device),
+        }
+    }
+
+    /// One step: every stream's row `(byte, freq, total, cum, coder freq)`, read back.
+    fn decode(&self, e: Tensor<2, Int>) -> Vec<i32> {
+        let rows = crate::fused::rans_decode(e, &self.x, &self.words, &self.at);
+        rows.into_data().convert::<i32>().try_to_vec().unwrap()
+    }
+}
+
+/// One decoding step on the device from one step's [`Slots`]: the forward pass, the rANS step,
+/// and training on the bytes it decoded, which never leave the device. Returns the rows (see
+/// [`GpuOps::rans_decode`](crate::fused::GpuOps::rans_decode)). Only for graphable predictors.
+fn decode_step(model: &mut Box<dyn Predictor>, lanes: &GpuLanes, slots: &Slots) -> Tensor<1, Int> {
+    let (ctx, guess, _) = slots.step(0);
+    let e = model.device_weights(ctx, guess).expect("a graphable predictor has its weights on the device");
+    let rows = crate::fused::rans_decode(e, &lanes.x, &lanes.words, &lanes.at);
+    let b = slots.batch;
+    // the decoded bytes, column 0 of the rows; the add makes them a fresh contiguous [b] rather
+    // than a strided view, whatever a kernel downstream assumes
+    model.learn(rows.clone().reshape([b, ROW]).narrow(1, 0, 1).reshape([b]) + 0);
+    rows
+}
+
 pub fn decompress(file: &[u8], prior: Option<&Prior>, device: &Device, progress: bool) -> Result<(Vec<u8>, Stats), String> {
-    let (n, o, checksum, prior_hash) = parse_header(file)?;
+    let (n, o, checksum, prior_hash, rans) = parse_header(file)?;
     match (prior_hash, prior) {
         (0, None) => {}
         (0, Some(_)) => return Err("this file was compressed without a prior".into()),
@@ -742,33 +1004,150 @@ pub fn decompress(file: &[u8], prior: Option<&Prior>, device: &Device, progress:
     let (m, n) = (o.model, n as usize);
     let len = n / m.batch;
     let tail = n - len * m.batch;
-    if file.len() < HEADER_LEN + tail {
+    let head = if rans { HEADER_LEN } else { HEADER_LEN_RANGE };
+    if file.len() < head + tail {
         return Err("file is truncated".into());
     }
-    let coded = &file[HEADER_LEN..file.len() - tail];
+    let coded = &file[head..file.len() - tail];
 
     let mut data = vec![0u8; n];
     let mut model = build(m, prior, device)?;
     let mut ctl = Controller::new(o.lcr_weight);
-    let mut dec = Decoder::new(coded);
-    let mut matcher = Matcher::new(m.matcher, m.batch);
+    let (mut dec, mut old) = if rans { (Some(Decoder::new(coded, m.batch)), None) } else { (None, Some(RangeDecoder::new(coded))) };
+    // files from before the rANS format were coded with the earlier match finder
+    let mut matcher = if rans { Matcher::new(m.matcher, m.batch, o.block as usize) } else { Matcher::styled(m.matcher, m.batch, MatchStyle::earlier(), 0) };
     let mut stats = Stats::default();
     let (t0, mut last_print) = (Instant::now(), Instant::now());
     let mut syms = vec![0i32; m.batch];
+    let mut q = vec![0u32; VOCAB];
+
+    // On the GPU the rANS lanes decode there too: the byte weights stay on the device and only
+    // each stream's row comes back, not all 256 frequencies, and no stream waits on another.
+    let lanes = (rans && crate::fused::on_gpu(&Tensor::<1, Int>::zeros([1], device)) && m.batch <= 1024 && m.batch % 32 == 0)
+        .then(|| GpuLanes::new(coded, m.batch, device));
+    // As in the encoder, a step can run as a replayed CUDA graph when nothing in it waits on the
+    // host: then the host only writes the step's inputs, replays, and reads the rows back. That
+    // needs every step trained (the controller decides per step from its cost otherwise).
+    let mut graphing = if lanes.is_some() && o.lcr_weight == 0 && model.graphable() && std::env::var("GMINT_GRAPH").map_or(true, |v| v != "0") {
+        Graphing::Idle
+    } else {
+        Graphing::Off
+    };
+    let slots = (graphing != Graphing::Off).then(|| Slots::new(&m, 1, device));
+    let mut captured: Option<Tensor<1, Int>> = None;
 
     for t in 0..len {
+        if progress && last_print.elapsed().as_secs() >= 5 {
+            last_print = Instant::now();
+            let done = t * m.batch;
+            eprintln!("  {:5.1}%  {:.0} KB/s", 100.0 * done as f64 / n as f64, done as f64 / 1024.0 / t0.elapsed().as_secs_f64());
+        }
+        // the first steps run plainly, so every kernel is compiled before the capture; the
+        // warm-up pass is not part of a step
+        if graphing != Graphing::Off && t >= 2 * FLUSH && t + 1 != m.warm {
+            let (lanes, slots) = (lanes.as_ref().unwrap(), slots.as_ref().unwrap());
+            let mut ctx_v = Vec::with_capacity(m.batch * m.ctx);
+            context_values(&mut ctx_v, &data, len, t, &m);
+            crate::fused::write_ints(&slots.ctx, ctx_v);
+            crate::fused::write_ints(&slots.guess, matcher.guess_values(&data, len, t));
+            let probe = &slots.target;
+            let out = match graphing {
+                Graphing::Ready => {
+                    model.refresh_steps();
+                    crate::fused::graph(probe, crate::fused::Graph::Replay).map(|_| captured.clone().unwrap())
+                }
+                Graphing::Idle => crate::fused::graph(probe, crate::fused::Graph::Prepare).map(|_| {
+                    graphing = Graphing::Warm;
+                    decode_step(&mut model, lanes, slots)
+                }),
+                _ => {
+                    model.refresh_steps();
+                    let recorded = crate::fused::graph(probe, crate::fused::Graph::Start).map(|_| decode_step(&mut model, lanes, slots));
+                    match recorded.and_then(|out| crate::fused::graph(probe, crate::fused::Graph::Stop).map(|_| out)) {
+                        Ok(out) => {
+                            graphing = Graphing::Ready;
+                            captured = Some(out.clone());
+                            crate::fused::graph(probe, crate::fused::Graph::Replay).map(|_| out)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+            let rows = match out {
+                Ok(rows) => rows,
+                Err(e) => {
+                    // a step that was only recorded has not run: run it plainly, and stay plain
+                    if progress {
+                        eprintln!("  CUDA graph unavailable ({e}); continuing without");
+                    }
+                    let _ = crate::fused::graph(probe, crate::fused::Graph::Drop);
+                    graphing = Graphing::Off;
+                    captured = None;
+                    decode_step(&mut model, lanes, slots)
+                }
+            };
+            let rows: Vec<i32> = rows.into_data().convert::<i32>().try_to_vec().unwrap();
+            for (s, row) in rows.chunks_exact(ROW).enumerate() {
+                data[s * len + t] = row[0] as u8;
+            }
+            let cost = step_cost(&rows);
+            matcher.advance(&data, len, t);
+            // weight 0 always trains, as the step just did
+            ctl.should_update(cost);
+            stats.updates += 1;
+            model.observe(cost);
+            stats.steps += 1;
+            continue;
+        }
         let guess = matcher.guesses(&data, len, t, device);
-        let freqs = model.predict(contexts(&data, len, t, &m, device), guess);
+        let ctx = contexts(&data, len, t, &m, device);
+        if let Some(rows) = lanes.as_ref().and_then(|l| model.device_weights(ctx.clone(), guess.clone()).map(|e| l.decode(e))) {
+            for (s, row) in rows.chunks_exact(ROW).enumerate() {
+                data[s * len + t] = row[0] as u8;
+                syms[s] = row[0];
+            }
+            let cost = step_cost(&rows);
+            matcher.advance(&data, len, t);
+            if ctl.should_update(cost) {
+                model.learn(targets(&syms, device));
+                stats.updates += 1;
+            }
+            model.observe(cost);
+            if t + 1 == m.warm {
+                replay(model.as_mut(), &data, len, m.warm, &m, device);
+            }
+            stats.steps += 1;
+            continue;
+        }
+        let freqs = model.predict(ctx, guess);
         let mut cost = 0;
         for (s, row) in freqs.chunks_exact(VOCAB).enumerate() {
             let total: u64 = row.iter().map(|f| *f as u64).sum();
-            let target = dec.target(total);
-            let (mut cum, mut sym) = (0u64, 0usize);
-            while cum + row[sym] as u64 <= target {
-                cum += row[sym] as u64;
-                sym += 1;
-            }
-            dec.consume(cum, row[sym] as u64);
+            let sym = match (&mut dec, &mut old) {
+                (Some(dec), _) => {
+                    // the coder's frequencies, from the cost frequencies
+                    crate::rans::quantize(row, &mut q);
+                    let slot = dec.slot(s);
+                    let (mut cum, mut sym) = (0u32, 0usize);
+                    while cum + q[sym] <= slot {
+                        cum += q[sym];
+                        sym += 1;
+                    }
+                    dec.consume(s, cum, q[sym]);
+                    sym
+                }
+                (None, Some(old)) => {
+                    let target = old.target(total);
+                    let (mut cum, mut sym) = (0u64, 0usize);
+                    while cum + row[sym] as u64 <= target {
+                        cum += row[sym] as u64;
+                        sym += 1;
+                    }
+                    old.consume(cum, row[sym] as u64);
+                    sym
+                }
+                (None, None) => unreachable!(),
+            };
             data[s * len + t] = sym as u8;
             syms[s] = sym as i32;
             cost += log2_q8(total) - log2_q8(row[sym] as u64);
@@ -783,17 +1162,12 @@ pub fn decompress(file: &[u8], prior: Option<&Prior>, device: &Device, progress:
             replay(model.as_mut(), &data, len, m.warm, &m, device);
         }
         stats.steps += 1;
-        if progress && last_print.elapsed().as_secs() >= 5 {
-            last_print = Instant::now();
-            let done = (t + 1) * m.batch;
-            eprintln!(
-                "  {:5.1}%  {:.0} KB/s",
-                100.0 * done as f64 / n as f64,
-                done as f64 / 1024.0 / t0.elapsed().as_secs_f64()
-            );
-        }
+    }
+    if graphing == Graphing::Ready {
+        let _ = crate::fused::graph(&slots.as_ref().unwrap().target, crate::fused::Graph::Drop);
     }
     data[len * m.batch..].copy_from_slice(&file[file.len() - tail..]);
+    let data = from_streams(&data, m.batch, o.block as usize);
     stats.seconds = t0.elapsed().as_secs_f64();
     if fnv1a(&data) != checksum {
         return Err("checksum mismatch: the decoder's model diverged from the encoder's, or the file is damaged".into());
@@ -821,7 +1195,7 @@ mod tests {
 
     fn options(rule: Rule, lcr_weight: u16) -> Options {
         let model = Config { arch: Arch::Attn, ctx: 8, emb: 16, hid: 64, batch: 128, lr: 13, rule, head: Head::Softmax, matcher: false, comps: 4, replicas: 4, short: 0, adapt: 0, warm: 0, norm: false, mask: false, seed: 7 };
-        Options { model, lcr_weight }
+        Options { model, lcr_weight, block: 0 }
     }
 
     #[test]
@@ -883,7 +1257,7 @@ mod tests {
             ("normalised, tree head, short branch", Config { norm: true, head: Head::Tree, short: 2, matcher: true, ..base }),
         ];
         for (name, model) in variants {
-            let o = Options { model, lcr_weight: 0 };
+            let o = Options { model, lcr_weight: 0, block: 0 };
             let (file, _) = compress(&data, &o, None, &device, false).unwrap();
             assert!(file.len() < data.len() * 9 / 10, "{name}: only reached {} of {}", file.len(), data.len());
             assert!(decompress(&file, None, &device, false).unwrap().0 == data, "{name}: round trip differs");
@@ -917,6 +1291,33 @@ mod tests {
         assert!(decompress(&matched, None, &device, false).unwrap().0 == data);
     }
 
+    /// A file in the range coder's format, written by commit 45c0779 with the match finder on
+    /// (testdata/), still decodes: it needs the earlier match finder, not today's.
+    #[test]
+    fn range_coded_file_still_decodes() {
+        let device = crate::fixed::test_device();
+        let file = include_bytes!("../testdata/gmint1-match.gm");
+        let want = include_bytes!("../testdata/gmint1-source.txt");
+        assert_eq!(&file[..6], MAGIC_RANGE);
+        assert_eq!(decompress(file, None, &device, false).unwrap().0, want.to_vec());
+    }
+
+    #[test]
+    fn stream_order_inverts() {
+        let data: Vec<u8> = (0..128 * 1000 + 37).map(|i| (i * 7 % 251) as u8).collect();
+        for block in [0usize, 1, 3, 100, 512, 999, 1000, 5000] {
+            let ordered = to_streams(&data, 128, block);
+            assert_eq!(from_streams(&ordered, 128, block), data, "block {block}");
+            if block == 0 || block >= 1000 {
+                assert_eq!(ordered, data, "block {block} should leave the input alone");
+            }
+        }
+        // stream 1 starts with input block 1, then block 1 + batch
+        let ordered = to_streams(&data, 128, 100);
+        assert_eq!(&ordered[1000..1100], &data[100..200]);
+        assert_eq!(&ordered[1100..1200], &data[(128 + 1) * 100..(128 + 2) * 100]);
+    }
+
     #[test]
     fn input_shorter_than_a_step_is_stored() {
         let device = crate::fixed::test_device();
@@ -937,7 +1338,7 @@ mod tests {
         let mut o = options(Rule::Auto, 0);
         (o.model.norm, o.model.mask) = (norm, mask);
         let mut model = Model::new(o.model, &device);
-        train_pass(&mut model, &sample(60_000), &device, |_, _, _| {});
+        train_pass(&mut model, &sample(60_000), 0, &device, |_, _, _| {});
         let bytes = Prior::encode(&o.model, &model.export());
         let dir = std::env::temp_dir().join(format!("gmint-prior-test-{}", std::process::id()));
         std::fs::write(&dir, &bytes).unwrap();

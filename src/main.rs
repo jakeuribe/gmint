@@ -8,6 +8,7 @@ mod fused;
 mod mix;
 mod ops;
 mod optim;
+mod rans;
 mod spn;
 
 use std::collections::HashMap;
@@ -49,6 +50,9 @@ options:
   --opt auto|sgd|norm  update rule (default auto: SGD whose rate follows the coded cost)
   --lr N               learning rate, 6..=22; each +1 halves the step (default 14)
   --lcr W[,W...]       latency weight of the update controller, 0..=256 (default 16)
+  --block N            streams take the input round-robin in blocks of N bytes, so the match
+                       finder sees nearly everything before a position; 0 gives each stream
+                       one contiguous slice (default 4096; train always uses 0)
   --prior FILE         start from pre-trained weights; the same file is needed to decompress
   --epochs N           passes over the samples when training (default 2)
   --mix on|off         train on all the samples at once, so every batch mixes them, rather
@@ -107,6 +111,9 @@ impl Args {
             None => default,
             Some(v) => fail(&format!("--{name}: expected on or off, got {v}")),
         }
+    }
+    fn block(&self) -> u32 {
+        u32::try_from(self.num("block", 4096)).unwrap_or_else(|_| fail("--block: too large"))
     }
     fn device(&self) -> Device {
         device(self.flags.get("device").map(String::as_str).unwrap_or("cuda"))
@@ -190,7 +197,7 @@ fn main() {
             let dry = cmd == "dry";
             let health = dry || args.flags.get("health").map(String::as_str) == Some("on");
             let data = args.input();
-            let mut o = Options { model: args.model(), lcr_weight: args.lcr_weights()[0] };
+            let mut o = Options { model: args.model(), lcr_weight: args.lcr_weights()[0], block: args.block() };
             if args.flags.get("scan").map(String::as_str) == Some("on") {
                 // Pre-scan: the choice is written in the header like any other configuration, so
                 // the decoder needs nothing extra.
@@ -203,7 +210,7 @@ fn main() {
                             if model.validate().is_err() {
                                 continue;
                             }
-                            let trial = Options { model, lcr_weight: o.lcr_weight };
+                            let trial = Options { model, ..o };
                             let size = codec::compress(&data[..head_len], &trial, None, &dev, false).map(|r| r.0.len());
                             if let Ok(size) = size {
                                 eprintln!("  scan: {head:?} match {matcher} lr {lr}: {size} bytes");
@@ -270,6 +277,13 @@ fn main() {
             } else {
                 samples
             };
+            // Each stream takes one contiguous slice of the pass, never blocks (--block): in the
+            // block order a step's streams all sit in one row of blocks, about a megabyte of the
+            // joined samples, so every batch would come from one sample again (trained that way,
+            // the auto rule stuck at 22 and the prior's held-out ratio fell from 2.58 to 1.83).
+            if args.flags.contains_key("block") {
+                fail("train takes no --block: batches would come from one sample at a time");
+            }
             let bytes: usize = samples.iter().map(|s| s.len() / cfg.batch * cfg.batch).sum();
             println!("{count} samples{}, {bytes} bytes per epoch, {cfg:?}", if mix { " mixed" } else { "" });
             for epoch in 1..=epochs {
@@ -278,7 +292,7 @@ fn main() {
                 for (n, sample) in samples.iter().enumerate() {
                     // in one long pass, a line at every tenth of it, so the epoch can be watched
                     let (here, mut tenths) = (sample.len() / cfg.batch * cfg.batch, 1);
-                    let this = codec::train_pass(&mut model, sample, &dev, |done, so_far, rate| {
+                    let this = codec::train_pass(&mut model, sample, 0, &dev, |done, so_far, rate| {
                         if samples.len() == 1 && done < here && done * 10 >= here * tenths {
                             tenths = done * 10 / here + 1;
                             let (coded, loss) = so_far.bits_per_byte(done);
@@ -321,12 +335,12 @@ fn main() {
             let (data, dev, model) = (args.input(), args.device(), args.model());
             // the first GPU use compiles kernels; keep that out of the first row's timing
             let prior = args.prior();
-            let _ = codec::compress(&data[..data.len().min(64 << 10)], &Options { model, lcr_weight: 0 }, None, &dev, false);
+            let _ = codec::compress(&data[..data.len().min(64 << 10)], &Options { model, lcr_weight: 0, block: args.block() }, None, &dev, false);
             println!("{} bytes, {model:?}", data.len());
             println!("{:>4}  {:>9}  {:>8}  {:>8}  {:>8}  {:>10}", "lcr", "bytes", "ratio", "seconds", "trained", "LCR s/ratio");
             let mut base: Option<(f64, f64)> = None;
             for w in args.lcr_weights() {
-                let (out, s) = codec::compress(&data, &Options { model, lcr_weight: w }, prior.as_ref(), &dev, false).unwrap_or_else(|e| fail(&e));
+                let (out, s) = codec::compress(&data, &Options { model, lcr_weight: w, block: args.block() }, prior.as_ref(), &dev, false).unwrap_or_else(|e| fail(&e));
                 let ratio = data.len() as f64 / out.len() as f64;
                 // TRACE eq. 5: latency added per unit of compression ratio gained, against the first row
                 let lcr = match base {
@@ -339,6 +353,30 @@ fn main() {
                     out.len(),
                     s.seconds,
                     100.0 * s.updates as f64 / s.steps.max(1) as f64
+                );
+            }
+        }
+        Some("matchstat") if args.pos.len() == 2 => {
+            // the match finder alone over the stream order, per style: no model, no device
+            let data = args.input();
+            let (batch, block) = (args.num("batch", 512), args.block() as usize);
+            let ordered = codec::to_streams(&data, batch, block);
+            let (now, old) = (codec::MatchStyle::default(), codec::MatchStyle::earlier());
+            let styles = [
+                ("default", now),
+                ("earlier", old),
+                ("default, no long", codec::MatchStyle { long: 0, ..now }),
+                ("default, unverified", codec::MatchStyle { verify: false, ..now }),
+                ("default, indexed as looked up", codec::MatchStyle { lookup_first: false, ..now }),
+            ];
+            let n = data.len() as f64;
+            println!("{} bytes, batch {batch}, block {block}: proposals and hits as % of all bytes", data.len());
+            for (name, style) in styles {
+                let [(p1, h1), (p2, h2)] = codec::Matcher::census(&ordered, batch, style, block);
+                println!(
+                    "  {name:<18} short: {:5.1}% proposed, {:5.1}% right   long: {:5.1}% proposed, {:5.1}% right   wrong overall {:4.1}%",
+                    100.0 * p1 as f64 / n, 100.0 * h1 as f64 / n, 100.0 * p2 as f64 / n, 100.0 * h2 as f64 / n,
+                    100.0 * (p1 + p2 - h1 - h2) as f64 / n
                 );
             }
         }
@@ -357,7 +395,7 @@ fn main() {
 
             let mut data = args.input();
             data.truncate(args.num("limit", 96 << 10));
-            let o = Options { model: Config { batch: 128, ..args.model() }, lcr_weight: args.lcr_weights()[0] };
+            let o = Options { model: Config { batch: 128, ..args.model() }, lcr_weight: args.lcr_weights()[0], block: args.block() };
             let (on_cuda, s) = codec::compress(&data, &o, None, &cuda, false).unwrap();
             report("cuda encode", data.len(), on_cuda.len(), &s);
             let (on_flex, s) = codec::compress(&data, &o, None, &flex, false).unwrap();

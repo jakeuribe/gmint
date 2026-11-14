@@ -114,18 +114,36 @@ pub fn one_hot_rows(n: usize, device: &Device) -> Tensor<2, Int> {
     Tensor::from_data(TensorData::new(v, [n, n]), device)
 }
 
-/// From Q20 byte weights `[B, VOCAB]` and the true bytes: (cumulative frequency below the byte,
-/// its frequency, row total) as `[B, 3]`, in the coder's frequencies (`weight >> 4`, plus 1).
+/// From Q20 byte weights `[B, VOCAB]` and the true bytes, `[B, 5]`: (cumulative frequency below
+/// the byte, its frequency, row total) in the cost frequencies (`weight >> 4`, plus 1), then
+/// (cumulative frequency below the byte, its frequency) in the coder's, which sum to 2^16 (see
+/// [`crate::rans::quantize`]).
 pub fn coded(e: Tensor<2, Int>, target: Tensor<1, Int>, below: &Tensor<2, Int>) -> Tensor<2, Int> {
-    let [b, _] = e.dims();
+    let [b, v] = e.dims();
     if fused::on_gpu(&e) {
         return fused::coded(e, target);
     }
+    let pick = below.clone().select(0, target.clone());
+    let at = |t: Tensor<2, Int>| t.gather(1, target.clone().reshape([b, 1]));
     // each frequency is at most 2^16 + 1, so a row sums to under 2^25
     let f = e.bitwise_right_shift_scalar(4) + 1;
-    let cum = (f.clone() * below.clone().select(0, target.clone())).sum_dim(1);
-    let own = f.clone().gather(1, target.reshape([b, 1]));
-    Tensor::cat(vec![cum, own, f.sum_dim(1)], 1)
+    let total = f.clone().sum_dim(1);
+    let cum = (f.clone() * pick.clone()).sum_dim(1);
+    // the coder's: max(1, floor(f 2^16 / T)), as quantize forms it. The product passes i32, so
+    // with a = 256 f it is (a / T) * 256 + 16 d1 + d2, where d1 and d2 are the next two base-16
+    // digits of the remainder's fraction: exact while T < 2^27
+    let a = f.clone() * 256;
+    let whole = a.clone() / total.clone();
+    let r1 = (a - whole.clone() * total.clone()) * 16;
+    let d1 = r1.clone() / total.clone();
+    let r2 = (r1 - d1.clone() * total.clone()) * 16;
+    let q = (whole * 256 + d1 * 16 + r2 / total.clone()).clamp_min(1);
+    // the largest takes the remainder, the lowest byte of equals: a unique key per byte
+    let byte = Tensor::<1, Int>::arange(0..v as i64, &target.device()).reshape([1, v]);
+    let top = (q.clone() * 256 - byte.clone() + 255).argmax(1);
+    let hot = (byte - top).abs().clamp(0, 1) * -1 + 1;
+    let q = q.clone() + hot * (q.sum_dim(1) * -1 + 65536);
+    Tensor::cat(vec![cum, at(f), total, (q.clone() * pick).sum_dim(1), at(q)], 1)
 }
 
 /// Temporary A/B switch: train a tree head through the match boost (see `Model::head_error`).
@@ -187,20 +205,30 @@ pub trait Predictor {
     fn predict(&mut self, ctx: Tensor<2, Int>, guess: Tensor<2, Int>) -> Vec<i32>;
     /// Train on the batch just predicted, given its true bytes.
     fn learn(&mut self, target: Tensor<1, Int>);
-    /// What the encoder needs and nothing more: for every stream the cumulative frequency below
-    /// the true byte, that byte's frequency, and the row total, `[batch, 3]`, left on the device.
-    /// The encoder knows the bytes in advance, so it can run many steps and read these back in
-    /// one go. The default goes through [`Self::predict`], which reads all 256 frequencies back.
+    /// [`Self::predict`] with the Q20 byte weights `[batch, VOCAB]` left on the device, for a
+    /// decoder that codes there; `None` when the predictor only has them on the host.
+    fn device_weights(&mut self, _ctx: Tensor<2, Int>, _guess: Tensor<2, Int>) -> Option<Tensor<2, Int>> {
+        None
+    }
+    /// What the encoder needs and nothing more, `[batch, 5]` left on the device: for every
+    /// stream the cost frequencies' (cumulative below the true byte, its own, row total) and the
+    /// coder's (cumulative below, own); see [`coded`]. The encoder knows the bytes in advance, so
+    /// it can run many steps and read these back in one go. The default goes through
+    /// [`Self::predict`], which reads all 256 frequencies back.
     fn predict_coded(&mut self, ctx: Tensor<2, Int>, guess: Tensor<2, Int>, target: Tensor<1, Int>) -> Tensor<2, Int> {
         let device = target.device();
         let syms: Vec<i32> = target.into_data().convert::<i32>().try_to_vec().unwrap();
         let freqs = self.predict(ctx, guess);
-        let mut out = Vec::with_capacity(syms.len() * 3);
+        let mut out = Vec::with_capacity(syms.len() * 5);
+        let mut q = vec![0u32; VOCAB];
         for (row, sym) in freqs.chunks_exact(VOCAB).zip(&syms) {
-            let cum: i32 = row[..*sym as usize].iter().sum();
-            out.extend([cum, row[*sym as usize], cum + row[*sym as usize..].iter().sum::<i32>()]);
+            let sym = *sym as usize;
+            let cum: i32 = row[..sym].iter().sum();
+            crate::rans::quantize(row, &mut q);
+            let qcum: u32 = q[..sym].iter().sum();
+            out.extend([cum, row[sym], cum + row[sym..].iter().sum::<i32>(), qcum as i32, q[sym] as i32]);
         }
-        Tensor::from_data(TensorData::new(out, [syms.len(), 3]), &device)
+        Tensor::from_data(TensorData::new(out, [syms.len(), 5]), &device)
     }
     /// Told the Q8 code length of every step, trained on or not, so a model can steer itself.
     /// Called after [`Self::learn`] for the same step, so a change takes effect from the next one.
@@ -1137,6 +1165,13 @@ impl Predictor for Model {
         let out = coded(cache.e.clone(), target, &self.below);
         self.pending = Some(cache);
         out
+    }
+
+    fn device_weights(&mut self, ctx: Tensor<2, Int>, guess: Tensor<2, Int>) -> Option<Tensor<2, Int>> {
+        let cache = self.forward(ctx, guess);
+        let e = cache.e.clone();
+        self.pending = Some(cache);
+        Some(e)
     }
 
     fn learn(&mut self, target: Tensor<1, Int>) {

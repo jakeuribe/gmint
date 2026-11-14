@@ -5,12 +5,15 @@
 const TOP: u64 = 1 << 56;
 const BOT: u64 = 1 << 48;
 
+/// Only the tests write this format now; files in it are still decoded.
+#[cfg(test)]
 pub struct Encoder {
     low: u64,
     range: u64,
     out: Vec<u8>,
 }
 
+#[cfg(test)]
 impl Encoder {
     pub fn new() -> Self {
         Self { low: 0, range: u64::MAX, out: Vec::new() }

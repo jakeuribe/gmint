@@ -59,9 +59,19 @@ pub trait GpuOps: Backend {
     /// `[n, e]`: row `r` is `floor(emb[idx[r]] / 2^8) + floor(pos[r mod t] / 2^8)`.
     fn embed(emb: IntTensor<Self>, pos: IntTensor<Self>, idx: IntTensor<Self>) -> IntTensor<Self>;
 
-    /// `[b, 3]` from Q20 byte weights `[b, vocab]` and the true bytes: in the coder's frequencies
-    /// (`weight >> 4`, plus 1), the cumulative frequency below the byte, its own, and the total.
+    /// `[b, 5]` from Q20 byte weights `[b, vocab]` and the true bytes. First, in the cost
+    /// frequencies (`weight >> 4`, plus 1): the cumulative frequency below the byte, its own, and
+    /// the row total. Then in the coder's, [`crate::rans::quantize`] of `weight >> 4`: the
+    /// cumulative frequency below the byte and its own.
     fn coded(e: IntTensor<Self>, target: IntTensor<Self>) -> IntTensor<Self>;
+
+    /// One rANS decoding step for every stream (see [`crate::rans`]): from Q20 byte weights
+    /// `[b, vocab]`, the lane states `x` (flat `[2 b]`, low and high word per lane, updated in
+    /// place), the coded words and the read position `at` (`[1]`, updated in place), each
+    /// stream's row `(byte, freq, total, cum, coder freq)`, flat `[5 b]`. Buffers are flat because
+    /// the kernels index them as such, and a 2-d tensor's rows may be padded. Needs `b <= 1024`,
+    /// a multiple of 32.
+    fn rans_decode(e: IntTensor<Self>, x: IntTensor<Self>, words: IntTensor<Self>, at: IntTensor<Self>) -> IntTensor<Self>;
 
     /// `prob - hot`, where `hot` is `scale` at each row's true byte and 0 elsewhere.
     fn onehot_error(prob: IntTensor<Self>, target: IntTensor<Self>, scale: i32) -> IntTensor<Self>;
@@ -1739,24 +1749,147 @@ mod kernel {
         }
     }
 
-    /// One cube per row of 256 byte weights.
+    /// One cube per row of 256 byte weights; see [`GpuOps::coded`](super::GpuOps::coded).
     #[cube(launch_unchecked, address_type = "dynamic")]
     pub fn coded(e: LinearView<'_, i32>, target: LinearView<'_, i32>, mut out: LinearViewMut<'_, i32>) {
         let row = CUBE_POS_X as usize;
         let v = UNIT_POS_X as usize;
         let byte = usize::cast_from(target.read(row));
         // weights are non-negative, so the plain shift is a floor
-        let f = (e.read(row * 256 + v) >> 4) + 1i32;
+        let g = e.read(row * 256 + v) >> 4;
+        let f = g + 1i32;
         let mut low = f * 0i32;
         if v < byte {
             low = f;
         }
         let total = cube_sum(f);
         let below = cube_sum(low);
+        // the coder's frequency, as rans::quantize forms it: max(1, floor(f 2^16 / total))
+        let q = max(i32::cast_from(u64::cast_from(f) * 65536u64 / u64::cast_from(total)), 1i32);
+        let sum = cube_sum(q);
+        // the largest frequency takes what the row is off from 2^16; equals go to the lowest byte
+        let key = cube_max(q * 256i32 + (255i32 - i32::cast_from(v)));
+        let mut qa = q;
+        if i32::cast_from(v) == 255i32 - (key & 255i32) {
+            qa = q + (65536i32 - sum);
+        }
+        let mut qlow = qa * 0i32;
+        if v < byte {
+            qlow = qa;
+        }
+        let qbelow = cube_sum(qlow);
         if v == byte {
-            out.write(row * 3, below);
-            out.write(row * 3 + 1, f);
-            out.write(row * 3 + 2, total);
+            out.write(row * 5, below);
+            out.write(row * 5 + 1, f);
+            out.write(row * 5 + 2, total);
+            out.write(row * 5 + 3, qbelow);
+            out.write(row * 5 + 4, qa);
+        }
+    }
+
+    /// Exclusive prefix sum over a cube of `32 * planes` units of one value each: per plane,
+    /// then the planes' totals. Every unit of the cube must call it.
+    #[cube]
+    fn cube_scan(value: i32, #[comptime] planes: usize) -> i32 {
+        let mut part = Shared::<[i32]>::new_slice(32usize);
+        let inclusive = plane_inclusive_sum(value);
+        if UNIT_POS_PLANE == 31 {
+            part[UNIT_POS_X as usize / 32] = inclusive;
+        }
+        sync_cube();
+        let mine = UNIT_POS_X as usize / 32;
+        let mut before = 0i32;
+        #[unroll]
+        for p in 0..planes {
+            if p < mine {
+                before += part[p];
+            }
+        }
+        sync_cube();
+        before + inclusive - value
+    }
+
+    /// [`cube_sum`] over a cube of `32 * planes` units.
+    #[cube]
+    fn cube_total(value: i32, #[comptime] planes: usize) -> i32 {
+        let mut part = Shared::<[i32]>::new_slice(32usize);
+        let s = plane_sum(value);
+        if UNIT_POS_PLANE == 0 {
+            part[UNIT_POS_X as usize / 32] = s;
+        }
+        sync_cube();
+        let mut total = 0i32;
+        #[unroll]
+        for p in 0..planes {
+            total += part[p];
+        }
+        sync_cube();
+        total
+    }
+
+    /// The decoder's half of [`coded`], one cube per stream: the row's coder frequencies, the
+    /// byte whose `[cum, cum + freq)` holds the slot of the stream's rANS state (see
+    /// [`crate::rans::Decoder`]), and that state with the byte taken off. Writes the row as
+    /// `(byte, freq, total, cum, coder freq)`, cost frequencies first as in [`coded`], and the
+    /// new state and whether it needs a word to `next` as `(low, high, needs)`.
+    #[cube(launch_unchecked, address_type = "dynamic")]
+    pub fn rans_rows(e: &Tensor<i32>, x: &Tensor<i32>, out: &mut Tensor<i32>, next: &mut Tensor<i32>) {
+        let row = CUBE_POS_X as usize;
+        let v = UNIT_POS_X as usize;
+        let f = (e[row * e.stride(0) + v * e.stride(1)] >> 4) + 1i32;
+        let total = cube_sum(f);
+        let q = max(i32::cast_from(u64::cast_from(f) * 65536u64 / u64::cast_from(total)), 1i32);
+        let sum = cube_sum(q);
+        let key = cube_max(q * 256i32 + (255i32 - i32::cast_from(v)));
+        let mut qa = q;
+        if i32::cast_from(v) == 255i32 - (key & 255i32) {
+            qa = q + (65536i32 - sum);
+        }
+        let cum = cube_scan(qa, 8usize);
+        // states are held as two i32 words; reinterpret, as a value cast need not keep the bits
+        let state = u64::cast_from(u32::reinterpret(x[row * 2])) | (u64::cast_from(u32::reinterpret(x[row * 2 + 1])) << 32u64);
+        let slot = i32::cast_from(state & 65535u64);
+        if cum <= slot && slot < cum + qa {
+            let taken = u64::cast_from(qa) * (state >> 16u64) + u64::cast_from(slot) - u64::cast_from(cum);
+            out[row * 5] = i32::cast_from(v);
+            out[row * 5 + 1] = f;
+            out[row * 5 + 2] = total;
+            out[row * 5 + 3] = cum;
+            out[row * 5 + 4] = qa;
+            next[row * 3] = i32::reinterpret(u32::cast_from(taken & 4294967295u64));
+            next[row * 3 + 1] = i32::reinterpret(u32::cast_from(taken >> 32u64));
+            let mut needs = 0i32;
+            if taken < 2147483648u64 {
+                needs = 1i32;
+            }
+            next[row * 3 + 2] = needs;
+        }
+    }
+
+    /// The streams' reads from the shared words, in one cube of all of them: a prefix sum over
+    /// the streams that need a word says which word each reads; states are written back to `x`
+    /// and the read position `at[0]` moves past the step's words. Past `nwords` reads are zero.
+    #[cube(launch_unchecked, address_type = "dynamic")]
+    pub fn rans_renorm(next: &Tensor<i32>, words: &Tensor<i32>, x: &mut Tensor<i32>, at: &mut Tensor<i32>, nwords: usize, #[comptime] planes: usize) {
+        let s = UNIT_POS_X as usize;
+        let needs = next[s * 3 + 2];
+        let offset = cube_scan(needs, planes);
+        let count = cube_total(needs, planes);
+        let base = at[0];
+        sync_cube();
+        let mut state = u64::cast_from(u32::reinterpret(next[s * 3])) | (u64::cast_from(u32::reinterpret(next[s * 3 + 1])) << 32u64);
+        if needs == 1i32 {
+            let w = usize::cast_from(base + offset);
+            let mut word = 0u32;
+            if w < nwords {
+                word = u32::reinterpret(words[w]);
+            }
+            state = (state << 32u64) | u64::cast_from(word);
+        }
+        x[s * 2] = i32::reinterpret(u32::cast_from(state & 4294967295u64));
+        x[s * 2 + 1] = i32::reinterpret(u32::cast_from(state >> 32u64));
+        if s == 0 {
+            at[0] = base + count;
         }
     }
 
@@ -2823,8 +2956,43 @@ impl GpuOps for CubeBackend {
     fn coded(e: IntTensor<Self>, target: IntTensor<Self>) -> IntTensor<Self> {
         let (b, vocab) = (e.meta.shape()[0], e.meta.shape()[1]);
         assert_eq!(vocab, 256);
-        let out = fresh!(e, [b, 3]);
+        let out = fresh!(e, [b, 5]);
         launch_on!(kernel::coded::launch_unchecked, (b, 256), [e, target], out,);
+        out
+    }
+
+    fn rans_decode(e: IntTensor<Self>, x: IntTensor<Self>, words: IntTensor<Self>, at: IntTensor<Self>) -> IntTensor<Self> {
+        use burn_cubecl::cubecl::{CubeCount, CubeDim};
+        let (b, vocab) = (e.meta.shape()[0], e.meta.shape()[1]);
+        assert!(vocab == 256 && b <= 1024 && b % 32 == 0);
+        let nwords = words.meta.shape().num_elements();
+        let out = fresh!(e, [b * 5]);
+        let next = fresh!(e, [b * 3]);
+        let address = [&e, &x, &words, &out].into_iter().map(|t| t.required_address_type()).max().unwrap_or_default();
+        unsafe {
+            kernel::rans_rows::launch_unchecked(
+                &e.client.clone(),
+                CubeCount::Static(b as u32, 1, 1),
+                CubeDim::new_1d(256),
+                address,
+                e.into_tensor_arg(),
+                x.clone().into_tensor_arg(),
+                out.clone().into_tensor_arg(),
+                next.clone().into_tensor_arg(),
+            );
+            kernel::rans_renorm::launch_unchecked(
+                &next.client.clone(),
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(b as u32),
+                address,
+                next.into_tensor_arg(),
+                words.into_tensor_arg(),
+                x.into_tensor_arg(),
+                at.into_tensor_arg(),
+                nwords,
+                b / 32,
+            );
+        }
         out
     }
 
@@ -3120,6 +3288,11 @@ pub fn coded(e: Tensor<2, Int>, target: Tensor<1, Int>) -> Tensor<2, Int> {
     Tensor::from_dispatch(Dispatch::coded(e.into_dispatch(), target.into_dispatch()))
 }
 
+/// One rANS decoding step on the GPU; see [`GpuOps::rans_decode`]. `x` and `at` change in place.
+pub fn rans_decode(e: Tensor<2, Int>, x: &Tensor<1, Int>, words: &Tensor<1, Int>, at: &Tensor<1, Int>) -> Tensor<1, Int> {
+    Tensor::from_dispatch(Dispatch::rans_decode(e.into_dispatch(), x.clone().into_dispatch(), words.clone().into_dispatch(), at.clone().into_dispatch()))
+}
+
 /// `prob - scale * onehot(target)` on the GPU.
 pub fn onehot_error(prob: Tensor<2, Int>, target: Tensor<1, Int>, scale: i32) -> Tensor<2, Int> {
     Tensor::from_dispatch(Dispatch::onehot_error(prob.into_dispatch(), target.into_dispatch(), scale))
@@ -3229,6 +3402,99 @@ mod timing {
             Ok(g) => println!("{name:<40} {queued:8.2} us queued {g:8.2} us on the GPU"),
             Err(e) => println!("{name:<40} {queued:8.2} us queued (graph: {e})"),
         }
+    }
+
+    /// The coder's frequencies from [`kernel::coded`] against [`crate::rans::quantize`].
+    ///   GMINT_TEST_DEVICE=cuda cargo test --release coded_matches -- --ignored
+    #[test]
+    #[ignore]
+    fn coded_matches_rans_quantize() {
+        let device = crate::fixed::test_device();
+        let mut rng = crate::fixed::Rng(17);
+        let (b, v) = (512usize, 256usize);
+        let mut e = Vec::with_capacity(b * v);
+        for row in 0..b {
+            // Q20 weights summing to at most 2^20: sharp, flat, sparse, and one row of nothing
+            let raw: Vec<u64> = match row % 4 {
+                0 => (0..v).map(|_| rng.next() % 1000).collect(),
+                1 => (0..v).map(|i| if i == row % v { 1 << 20 } else { rng.next() % 3 }).collect(),
+                2 => (0..v).map(|_| if rng.next() % 32 == 0 { rng.next() % (1 << 20) } else { 0 }).collect(),
+                _ => vec![0; v],
+            };
+            let sum = raw.iter().sum::<u64>().max(1);
+            e.extend((0..v).map(|i| match row % 8 {
+                7 => 0,
+                // as a mix leaves them: relative to the top byte, so a row sums far past 2^20
+                6 => if i == 0 { 1 << 20 } else { (rng.next() % (1 << 20)) as i32 },
+                _ => (raw[i] * (1 << 20) / sum) as i32,
+            }));
+        }
+        let target: Vec<i32> = (0..b).map(|_| (rng.next() % v as u64) as i32).collect();
+        let got: Vec<i32> = coded(Tensor::from_data(TensorData::new(e.clone(), [b, v]), &device), Tensor::from_data(TensorData::new(target.clone(), [b]), &device))
+            .into_data()
+            .convert::<i32>()
+            .try_to_vec()
+            .unwrap();
+        let (mut g, mut q) = (vec![0i32; v], vec![0u32; v]);
+        for row in 0..b {
+            let w = &e[row * v..(row + 1) * v];
+            let t = target[row] as usize;
+            g.iter_mut().zip(w).for_each(|(g, w)| *g = (w >> 4) + 1);
+            crate::rans::quantize(&g, &mut q);
+            let f = g.clone();
+            let want = [f[..t].iter().sum::<i32>(), f[t], f.iter().sum(), q[..t].iter().sum::<u32>() as i32, q[t] as i32];
+            assert_eq!(&got[row * 5..row * 5 + 5], &want, "row {row}");
+        }
+    }
+
+    /// [`kernel::rans_rows`] and [`kernel::rans_renorm`] decode what [`crate::rans::Encoder`]
+    /// wrote, step by step, as the host decoder does.
+    ///   GMINT_TEST_DEVICE=cuda cargo test --release rans_decode_matches -- --ignored
+    #[test]
+    #[ignore]
+    fn rans_decode_matches_host() {
+        let device = crate::fixed::test_device();
+        let mut rng = crate::fixed::Rng(23);
+        let (b, v, steps) = (512usize, 256usize, 40usize);
+        let mut weights = Vec::new();
+        let mut enc = crate::rans::Encoder::new(b);
+        let mut want = Vec::new();
+        let mut q = vec![0u32; v];
+        for step in 0..steps {
+            let mut e = Vec::with_capacity(b * v);
+            for row in 0..b {
+                let hot = (rng.next() % v as u64) as usize;
+                for i in 0..v {
+                    e.push(match (row + step) % 3 {
+                        0 if i == hot => 1 << 20,
+                        0 => (rng.next() % 64) as i32,
+                        1 => (rng.next() % 8192) as i32,
+                        _ => if i % 7 == 0 { (rng.next() % (1 << 20)) as i32 } else { 0 },
+                    });
+                }
+                let f: Vec<i32> = e[row * v..].iter().map(|w| (w >> 4) + 1).collect();
+                crate::rans::quantize(&f, &mut q);
+                let sym = if rng.next() % 3 == 0 { (rng.next() % v as u64) as usize } else { (0..v).max_by_key(|i| q[*i]).unwrap() };
+                enc.push(q[..sym].iter().sum(), q[sym]);
+                want.push(sym as i32);
+            }
+            weights.push(e);
+        }
+        let bytes = enc.finish();
+        let host = crate::rans::Decoder::new(&bytes, b);
+        let x: Vec<i32> = host.x.iter().flat_map(|s| [*s as u32 as i32, (*s >> 32) as u32 as i32]).collect();
+        let words: Vec<i32> = bytes[8 * b..].chunks(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
+        let n = words.len();
+        let x = Tensor::<1, Int>::from_data(TensorData::new(x, [2 * b]), &device);
+        let words = Tensor::<1, Int>::from_data(TensorData::new(words, [n]), &device);
+        let at = Tensor::<1, Int>::from_data(TensorData::new(vec![0i32], [1]), &device);
+        for (step, e) in weights.into_iter().enumerate() {
+            let rows: Vec<i32> = rans_decode(Tensor::from_data(TensorData::new(e, [b, v]), &device), &x, &words, &at).into_data().convert::<i32>().try_to_vec().unwrap();
+            let got: Vec<i32> = rows.chunks_exact(5).map(|r| r[0]).collect();
+            assert_eq!(got, want[step * b..(step + 1) * b], "step {step}");
+        }
+        let at: Vec<i32> = at.into_data().convert::<i32>().try_to_vec().unwrap();
+        assert_eq!(at[0] as usize, n, "every word read");
     }
 
     #[test]

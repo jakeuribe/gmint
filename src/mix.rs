@@ -109,6 +109,10 @@ impl Predictor for Mix {
         coded(e, target, &self.below)
     }
 
+    fn device_weights(&mut self, ctx: Tensor<2, Int>, guess: Tensor<2, Int>) -> Option<Tensor<2, Int>> {
+        Some(self.weights(ctx, guess))
+    }
+
     fn learn(&mut self, target: Tensor<1, Int>) {
         let p = self.pending.take().expect("learn without a preceding predict");
         // dL/dscores, Q12; the scores were added, so every part sees the same error. The integer
