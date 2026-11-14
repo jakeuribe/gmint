@@ -306,6 +306,7 @@ mod tests {
         adapt: 0,
         warm: 0,
         norm: false,
+        mask: false,
         seed: 7,
     };
 

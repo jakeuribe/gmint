@@ -42,6 +42,8 @@ options:
   --spn-adapt off|prune|grow   prune weak sum-node children, or prune and regrow them
   --warm STEPS         after STEPS steps, train once more on everything coded so far
   --norm on|off        scale each hidden unit's input to a fixed running spread (default off)
+  --mask on|off        pass no error back through a forward clamp where it held (default on;
+                       off is how files were coded before the option existed)
   --health on          with c: also print the model's health at every tenth of the input
   --scan on            try several configurations on the start of the input, keep the best
   --opt auto|sgd|norm  update rule (default auto: SGD whose rate follows the coded cost)
@@ -95,6 +97,15 @@ impl Args {
             None => default,
         }
     }
+    /// An on|off flag.
+    fn switch(&self, name: &str, default: bool) -> bool {
+        match self.flags.get(name).map(String::as_str) {
+            Some("on") => true,
+            Some("off") => false,
+            None => default,
+            Some(v) => fail(&format!("--{name}: expected on or off, got {v}")),
+        }
+    }
     fn device(&self) -> Device {
         device(self.flags.get("device").map(String::as_str).unwrap_or("cuda"))
     }
@@ -112,17 +123,8 @@ impl Args {
     }
     /// The model shape comes from the prior when there is one.
     fn model(&self) -> Config {
-        let shape = self.prior().map(|p| (p.ctx, p.emb, p.hid, p.head, p.matcher, p.norm));
-        let norm = match self.flags.get("norm").map(String::as_str) {
-            Some("on") => true,
-            Some("off") | None => false,
-            Some(v) => fail(&format!("--norm: expected on or off, got {v}")),
-        };
-        let matcher = match self.flags.get("match").map(String::as_str) {
-            Some("on") => true,
-            Some("off") | None => false,
-            Some(v) => fail(&format!("--match: expected on or off, got {v}")),
-        };
+        let shape = self.prior().map(|p| (p.ctx, p.emb, p.hid, p.head, p.matcher, p.norm, p.mask));
+        let (norm, matcher, mask) = (self.switch("norm", false), self.switch("match", false), self.switch("mask", true));
         let head = match self.flags.get("head") {
             Some(name) => fixed::Head::from_name(name).unwrap_or_else(|| fail(&format!("--head: unknown head {name}"))),
             None => fixed::Head::Softmax,
@@ -154,6 +156,7 @@ impl Args {
             head: shape.map_or(head, |s| s.3),
             matcher: shape.map_or(matcher, |s| s.4),
             norm: shape.map_or(norm, |s| s.5),
+            mask: shape.map_or(mask, |s| s.6),
             seed: self.num("seed", 7) as u64,
         };
         cfg.validate().unwrap_or_else(|e| fail(&e));

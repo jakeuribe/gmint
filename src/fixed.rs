@@ -442,6 +442,9 @@ pub struct Config {
     pub warm: usize,
     /// Normalise the hidden layer's pre-activations per unit with running statistics.
     pub norm: bool,
+    /// Pass no error back through a forward clamp where it held (on q, k, v and the residual;
+    /// the hidden layer's ReLU always does this). Off, the clamps pass errors straight through.
+    pub mask: bool,
     pub seed: u64,
 }
 
@@ -880,7 +883,13 @@ impl Model {
         // |g @ w2^T| <= 256 * 4096 * 1023 < 2^30
         let back = |bound: i32| Mat { wt: true, wshift: 8, shift: 8, bound };
         let dh = fused::matmul(g.clone(), c.w2.clone(), back(UNBOUNDED));
-        let dh = if leaky() {
+        let dh = if leaky() && self.cfg.mask {
+            // slope 1 inside (0, ACT_MAX), 1/8 at or below zero, 0 where either clamp held
+            let up = c.h.clone().clamp(0, 1);
+            let inside = up.clone() * (c.h.clone() * -1 + ACT_MAX).clamp(0, 1);
+            let below = (up * -1 + 1) * (c.h.clone() + ACT_MAX).clamp(0, 1);
+            shr_floor(dh.clamp(-ERR_MAX, ERR_MAX) * (inside * 8 + below), 3)
+        } else if leaky() {
             // slope 1 above zero (saturation passes straight through), 1/8 at or below it
             shr_floor(dh.clamp(-ERR_MAX, ERR_MAX) * (c.h.clone().clamp(0, 1) * 7 + 1), 3)
         } else if fused::on_gpu(&dh) {
@@ -900,8 +909,12 @@ impl Model {
         // chunk sums: 128 * 2^10 * 2^12 = 2^29
         let dw2 = group(c.h.clone(), g, &self.p.w2, 6);
         crate::ops::prof::lap(&self.device, "b: dw2");
-        // |dh @ w1^T| <= 256 * 4095 * 1023 < 2^30
-        let dz = fused::matmul(dh.clone(), c.w1.clone(), back(ERR_MAX)).reshape([b, t, e]);
+        // With the mask, each error below stops where its value's forward clamp to +-ACT_MAX
+        // held: the clamp's own derivative, so no weight is pushed on past where it changes
+        // anything. Without it, the clamps pass errors straight through.
+        let mask = self.cfg.mask;
+        // |dh @ w1^T| <= 256 * 4095 * 1023 < 2^30; the residual zf was clamped
+        let dz = fused::matmul_gated(dh.clone(), c.w1.clone(), back(ERR_MAX), mask.then_some((&c.zf, ACT_MAX))).reshape([b, t, e]);
         // chunk sums: 128 * 2^10 * 2^12 = 2^29
         let dw1 = group(c.zf.clone(), dh, &self.p.w1, 5);
         crate::ops::prof::lap(&self.device, "b: dw1");
@@ -909,11 +922,11 @@ impl Model {
         crate::ops::prof::lap(&self.device, "b: dz");
         // attention: y = a @ v
         // |a^T @ dz| <= ctx * 4096 * 4095 < 2^30 for ctx <= 64
-        let dv = fused::small_matmul(c.a.clone(), dz.clone(), true, 12, ERR_MAX);
+        let dv = fused::small_matmul_gated(c.a.clone(), dz.clone(), true, 12, ERR_MAX, mask.then_some((&c.v, ACT_MAX)));
         let ds = fused::attn_ds(dz.clone(), c.v.clone(), c.a.clone(), ERR_MAX);
         // |ds @ k| and |ds^T @ q| <= 64 * 2^12 * 2^10 = 2^28
-        let dq = fused::small_matmul(ds.clone(), c.k.clone(), false, 8, ERR_MAX);
-        let dk = fused::small_matmul(ds, c.q.clone(), true, 8, ERR_MAX);
+        let dq = fused::small_matmul_gated(ds.clone(), c.k.clone(), false, 8, ERR_MAX, mask.then_some((&c.q, ACT_MAX)));
+        let dk = fused::small_matmul_gated(ds, c.q.clone(), true, 8, ERR_MAX, mask.then_some((&c.k, ACT_MAX)));
         crate::ops::prof::lap(&self.device, "b: attention");
         let flat = |x: &Tensor<3, Int>| x.clone().reshape([b * t, e]);
         let xf = flat(&c.x);
@@ -1166,7 +1179,7 @@ mod tests {
     use burn::tensor::activation::log_softmax;
 
     const CFG: Config =
-        Config { arch: Arch::Attn, ctx: 8, emb: 32, hid: 256, batch: 128, lr: 12, rule: Rule::Sgd, head: Head::Softmax, matcher: false, comps: 4, replicas: 4, short: 0, adapt: 0, warm: 0, norm: false, seed: 7 };
+        Config { arch: Arch::Attn, ctx: 8, emb: 32, hid: 256, batch: 128, lr: 12, rule: Rule::Sgd, head: Head::Softmax, matcher: false, comps: 4, replicas: 4, short: 0, adapt: 0, warm: 0, norm: false, mask: true, seed: 7 };
 
     fn ints(t: &Tensor<2, Int>) -> Vec<i32> {
         t.clone().into_data().convert::<i32>().try_to_vec().unwrap()

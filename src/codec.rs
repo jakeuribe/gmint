@@ -162,6 +162,8 @@ pub struct Prior {
     pub head: Head,
     pub matcher: bool,
     pub norm: bool,
+    /// Trained with [`Config::mask`]; a file coded from the prior is coded the same way.
+    pub mask: bool,
     pub values: Vec<i32>,
     pub hash: u64,
 }
@@ -169,7 +171,9 @@ pub struct Prior {
 impl Prior {
     fn encode(c: &Config, values: &[i32]) -> Vec<u8> {
         let mut out = PRIOR_MAGIC.to_vec();
-        for d in [c.ctx, c.emb, c.hid, c.head.id() as usize, c.matcher as usize | (c.norm as usize) << 1] {
+        // flags: bit 0 the match finder, bit 1 the normalised layer, bit 2 the mask (priors made
+        // before it existed have the bit clear, and were trained without it)
+        for d in [c.ctx, c.emb, c.hid, c.head.id() as usize, c.matcher as usize | (c.norm as usize) << 1 | (c.mask as usize) << 2] {
             out.extend((d as u16).to_le_bytes());
         }
         out.extend(values.iter().flat_map(|v| v.to_le_bytes()));
@@ -188,7 +192,11 @@ impl Prior {
         let dim = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as usize;
         let values = b[18..].chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
         let head = Head::from_id(dim(14) as u8).ok_or_else(|| format!("{path}: unknown head"))?;
-        Ok(Self { ctx: dim(8), emb: dim(10), hid: dim(12), head, matcher: dim(16) & 1 != 0, norm: dim(16) & 2 != 0, values, hash: fnv1a(&b) })
+        let flags = dim(16);
+        if flags > 7 {
+            return Err(format!("{path}: unknown prior flags {flags:#x}"));
+        }
+        Ok(Self { ctx: dim(8), emb: dim(10), hid: dim(12), head, matcher: flags & 1 != 0, norm: flags & 2 != 0, mask: flags & 4 != 0, values, hash: fnv1a(&b) })
     }
 }
 
@@ -202,10 +210,10 @@ fn build(m: Config, prior: Option<&Prior>, device: &Device) -> Result<Box<dyn Pr
     }
     let mut model = Model::new(m, device);
     if let Some(p) = prior {
-        if (p.ctx, p.emb, p.hid, p.head, p.matcher, p.norm) != (m.ctx, m.emb, m.hid, m.head, m.matcher, m.norm) {
+        if (p.ctx, p.emb, p.hid, p.head, p.matcher, p.norm, p.mask) != (m.ctx, m.emb, m.hid, m.head, m.matcher, m.norm, m.mask) {
             return Err(format!(
-                "prior is for ctx {} emb {} hid {} {:?} match {} norm {}, not the model's shape",
-                p.ctx, p.emb, p.hid, p.head, p.matcher, p.norm
+                "prior is for ctx {} emb {} hid {} {:?} match {} norm {} mask {}, not the model's shape",
+                p.ctx, p.emb, p.hid, p.head, p.matcher, p.norm, p.mask
             ));
         }
         model.import(&p.values)?;
@@ -382,7 +390,8 @@ fn header(n: u64, o: &Options, checksum: u64, prior_hash: u64) -> Vec<u8> {
     h.push(m.arch.id());
     h.extend([m.comps as u8, m.replicas as u8, m.short as u8, m.adapt]);
     h.extend((m.warm as u16).to_le_bytes());
-    h.push(m.norm as u8);
+    // bit 0 the normalised layer, bit 1 the mask; files from before the mask have it clear
+    h.push(m.norm as u8 | (m.mask as u8) << 1);
     h
 }
 
@@ -407,9 +416,13 @@ fn parse_header(b: &[u8]) -> Result<(u64, Options, u64, u64), String> {
         short: b[57] as usize,
         adapt: b[58],
         warm: u16_at(59) as usize,
-        norm: b[61] != 0,
+        norm: b[61] & 1 != 0,
+        mask: b[61] & 2 != 0,
         seed: u64_at(27),
     };
+    if b[61] > 3 {
+        return Err("unknown model flags".into());
+    }
     model.validate()?;
     Ok((u64_at(6), Options { model, lcr_weight: u16_at(25) }, u64_at(35), u64_at(44)))
 }
@@ -805,7 +818,7 @@ mod tests {
     }
 
     fn options(rule: Rule, lcr_weight: u16) -> Options {
-        let model = Config { arch: Arch::Attn, ctx: 8, emb: 16, hid: 64, batch: 128, lr: 13, rule, head: Head::Softmax, matcher: false, comps: 4, replicas: 4, short: 0, adapt: 0, warm: 0, norm: false, seed: 7 };
+        let model = Config { arch: Arch::Attn, ctx: 8, emb: 16, hid: 64, batch: 128, lr: 13, rule, head: Head::Softmax, matcher: false, comps: 4, replicas: 4, short: 0, adapt: 0, warm: 0, norm: false, mask: false, seed: 7 };
         Options { model, lcr_weight }
     }
 
@@ -864,6 +877,7 @@ mod tests {
             ("warm-up", Config { warm: 96, matcher: true, ..base }),
             ("warm-up, off the window", Config { warm: 50, ..base }),
             ("normalised hidden layer", Config { norm: true, ..base }),
+            ("masked clamps", Config { mask: true, ..base }),
             ("normalised, tree head, short branch", Config { norm: true, head: Head::Tree, short: 2, matcher: true, ..base }),
         ];
         for (name, model) in variants {
@@ -912,14 +926,14 @@ mod tests {
     #[test]
     fn prior_helps_and_must_match() {
         let device = crate::fixed::test_device();
-        for norm in [false, true] {
-            prior_round_trip(norm, &device);
+        for (norm, mask) in [(false, false), (true, false), (false, true)] {
+            prior_round_trip(norm, mask, &device);
         }
     }
 
-    fn prior_round_trip(norm: bool, device: &Device) {
+    fn prior_round_trip(norm: bool, mask: bool, device: &Device) {
         let mut o = options(Rule::Auto, 0);
-        o.model.norm = norm;
+        (o.model.norm, o.model.mask) = (norm, mask);
         let mut model = Model::new(o.model, &device);
         train_pass(&mut model, &sample(60_000), &device);
         let bytes = Prior::encode(&o.model, &model.export());

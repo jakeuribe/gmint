@@ -39,6 +39,14 @@ pub trait GpuOps: Backend {
     /// transposed when `mt`) and `n: [b, t, e]`.
     fn small_matmul(m: IntTensor<Self>, n: IntTensor<Self>, mt: bool, shift: u32, bound: i32) -> IntTensor<Self>;
 
+    /// [`GpuOps::small_matmul`], then 0 wherever `|gate| >= act_max`; `gate` is `[b, t, e]`.
+    fn small_matmul_gated(m: IntTensor<Self>, n: IntTensor<Self>, gate: IntTensor<Self>, mt: bool, shift: u32, bound: i32, act_max: i32) -> IntTensor<Self>;
+
+    /// [`FusedOps::matmul_shr_clamp`], then 0 wherever `|gate| >= act_max`; `gate` is shaped
+    /// like the result.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_gated(x: IntTensor<Self>, w: IntTensor<Self>, gate: IntTensor<Self>, wt: bool, wshift: u32, shift: u32, bound: i32, act_max: i32) -> IntTensor<Self>;
+
     /// `[n / chunk, a, b]`: for every run of `chunk` rows of `x: [n, a]` and `y: [n, b]`, their
     /// `x^T @ y` floor-divided by 2^cshift.
     fn chunked_xty(x: IntTensor<Self>, y: IntTensor<Self>, chunk: usize, cshift: u32) -> IntTensor<Self>;
@@ -214,16 +222,22 @@ mod kernel {
     ///
     /// Shifts are floor divisions: the value is biased non-negative first, so the shift means the
     /// same whether the target shifts signed values arithmetically or not.
+    ///
+    /// When `gated`, the result is 0 wherever `|gate| >= act_max` (`gate` is shaped like the
+    /// result), as [`masked`] does it; otherwise `gate` is not read.
     #[cube(launch_unchecked, address_type = "dynamic")]
     pub fn matmul_shr_clamp(
         x: LinearView<'_, i32>,
         w: LinearView<'_, i32>,
+        gate: LinearView<'_, i32>,
         mut out: LinearViewMut<'_, i32>,
         k: usize,
         m: usize,
         wshift: i32,
         shift: i32,
         bound: i32,
+        act_max: i32,
+        #[comptime] gated: bool,
     ) {
         if !out.is_in_bounds(ABSOLUTE_POS) {
             terminate!();
@@ -238,7 +252,22 @@ mod kernel {
         }
         let value = ((acc + 1073741824i32) >> shift) - (1073741824i32 >> shift);
         let low = 0i32 - bound;
-        out.write(ABSOLUTE_POS, clamp(value, low, bound));
+        let mut value = clamp(value, low, bound);
+        if gated {
+            value = masked(value, gate.read(ABSOLUTE_POS), act_max);
+        }
+        out.write(ABSOLUTE_POS, value);
+    }
+
+    /// `value`, or 0 where the forward clamp to +-`act_max` held on `gate`: the clamp's own
+    /// derivative, so no error flows back through a value the clamp cut.
+    #[cube]
+    fn masked(value: i32, gate: i32, act_max: i32) -> i32 {
+        let mut out = value;
+        if gate >= act_max || gate <= 0i32 - act_max {
+            out = 0i32;
+        }
+        out
     }
 
     /// Splits four values into their high and low bytes (`v = 128 hi + lo`, `hi` in
@@ -266,10 +295,12 @@ mod kernel {
     /// of four k-consecutive bytes, the weight column-major, so every fragment register is one
     /// word; rows are `ks / 4 + 4` words apart, which puts a fragment's 32 words in 32 banks.
     /// Each operand's next slice is loaded into registers while the current one is multiplied.
+    /// `gate`, `act_max` and `gated` as in [`matmul_shr_clamp`].
     #[cube(launch_unchecked, address_type = "dynamic")]
     pub fn matmul_mma(
         x: &Tensor<i32>,
         w: &Tensor<i32>,
+        gate: &Tensor<i32>,
         out: &mut Tensor<i32>,
         n: usize,
         k: usize,
@@ -278,9 +309,11 @@ mod kernel {
         shift: i32,
         low: i32,
         high: i32,
+        act_max: i32,
         #[comptime] wr: usize,
         #[comptime] wc: usize,
         #[comptime] ks: usize,
+        #[comptime] gated: bool,
     ) {
         let def = cmma::MmaDefinition::<i8, i8, i32>::new(16usize, 8usize, 32usize);
         let units = comptime!(32 * wr * wc);
@@ -489,6 +522,7 @@ mod kernel {
         }
 
         let (so0, so1) = (out.stride(0), out.stride(1));
+        let (sg0, sg1) = (gate.stride(0), gate.stride(1));
         #[unroll]
         for nt in 0..2usize {
             #[unroll]
@@ -509,7 +543,11 @@ mod kernel {
                     if r < n && c < m {
                         let total = vh.extract(q) * 16384i32 + vm.extract(q) * 128i32 + vl.extract(q);
                         let value = ((total + 1073741824i32) >> shift) - (1073741824i32 >> shift);
-                        out[r * so0 + c * so1] = clamp(value, low, high);
+                        let mut value = clamp(value, low, high);
+                        if gated {
+                            value = masked(value, gate[r * sg0 + c * sg1], act_max);
+                        }
+                        out[r * so0 + c * so1] = value;
                     }
                 }
             }
@@ -795,10 +833,12 @@ mod kernel {
     /// threads read neighbouring words. `w` is read through its strides as `[k, m]`, so a
     /// transposed weight is a view and needs no copy. Integer sums do not depend on the order
     /// they are formed in, so this gives the same bits as the one-thread-per-output kernel.
+    /// `gate`, `act_max` and `gated` as in [`matmul_shr_clamp`].
     #[cube(launch_unchecked, address_type = "dynamic")]
     pub fn matmul_tiled(
         x: &Tensor<i32>,
         w: &Tensor<i32>,
+        gate: &Tensor<i32>,
         out: &mut Tensor<i32>,
         n: usize,
         k: usize,
@@ -807,8 +847,10 @@ mod kernel {
         shift: i32,
         low: i32,
         high: i32,
+        act_max: i32,
         #[comptime] tr: usize,
         #[comptime] tc: usize,
+        #[comptime] gated: bool,
     ) {
         let bm = comptime!(16 * tr);
         let bn = comptime!(16 * tc);
@@ -878,6 +920,7 @@ mod kernel {
             k0 += 16;
         }
         let (so0, so1) = (out.stride(0), out.stride(1));
+        let (sg0, sg1) = (gate.stride(0), gate.stride(1));
         #[unroll]
         for i in 0..tr {
             let r = row0 + ty + 16 * i;
@@ -886,7 +929,11 @@ mod kernel {
                 let c = col0 + tx + 16 * j;
                 if r < n && c < m {
                     let value = ((acc[i * tc + j] + 1073741824i32) >> shift) - (1073741824i32 >> shift);
-                    out[r * so0 + c * so1] = clamp(value, low, high);
+                    let mut value = clamp(value, low, high);
+                    if gated {
+                        value = masked(value, gate[r * sg0 + c * sg1], act_max);
+                    }
+                    out[r * so0 + c * so1] = value;
                 }
             }
         }
@@ -1063,17 +1110,21 @@ mod kernel {
 
 
 
-    /// One thread per output element of a per-stream matmul.
+    /// One thread per output element of a per-stream matmul. `gate`, `act_max` and `gated` as in
+    /// [`matmul_shr_clamp`].
     #[cube(launch_unchecked, address_type = "dynamic")]
     pub fn small_matmul(
         m: LinearView<'_, i32>,
         n: LinearView<'_, i32>,
+        gate: LinearView<'_, i32>,
         mut out: LinearViewMut<'_, i32>,
         t: usize,
         e: usize,
         mt: usize,
         shift: i32,
         bound: i32,
+        act_max: i32,
+        #[comptime] gated: bool,
     ) {
         if !out.is_in_bounds(ABSOLUTE_POS) {
             terminate!();
@@ -1091,7 +1142,11 @@ mod kernel {
         }
         let value = ((acc + 1073741824i32) >> shift) - (1073741824i32 >> shift);
         let low = 0i32 - bound;
-        out.write(ABSOLUTE_POS, clamp(value, low, bound));
+        let mut value = clamp(value, low, bound);
+        if gated {
+            value = masked(value, gate.read(ABSOLUTE_POS), act_max);
+        }
+        out.write(ABSOLUTE_POS, value);
     }
 
     /// Sum over a cube of 256 units of one value each, handed to every unit: per plane (warp of
@@ -2176,53 +2231,47 @@ impl FusedOps for CubeBackend {
     }
 
     fn matmul_shr_clamp(x: IntTensor<Self>, w: IntTensor<Self>, wt: bool, wshift: u32, shift: u32, bound: i32) -> IntTensor<Self> {
-        use burn_cubecl::cubecl::{CubeCount, CubeDim, calculate_cube_count_elemwise};
-        use burn_cubecl::kernel::into_contiguous;
-        use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
+        cube_matmul(x, w, wt, wshift, shift, bound, None)
+    }
+}
 
-        // the tiled kernel reads the weight through its strides, so a transpose is only a view
-        let w = if wt { Self::int_swap_dims(w, 0, 1) } else { w };
-        static NAIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*NAIVE.get_or_init(|| std::env::var_os("GMINT_NAIVE_MATMUL").is_some()) {
-            let (n, k, m) = (x.meta.shape()[0], x.meta.shape()[1], w.meta.shape()[1]);
-            let out = empty_device_contiguous_dtype(x.client.clone(), x.device.clone(), Shape::from([n, m]), x.dtype);
-            if use_mma() {
-                let (wr, wc, ks) = mma_shape(n, m);
-                let address = [&x, &w, &out].into_iter().map(|t| t.required_address_type()).max().unwrap_or_default();
-                unsafe {
-                    kernel::matmul_mma::launch_unchecked(
-                        &out.client,
-                        CubeCount::Static(n.div_ceil(16 * wr) as u32, m.div_ceil(16 * wc) as u32, 1),
-                        CubeDim::new_1d((32 * wr * wc) as u32),
-                        address,
-                        x.into_tensor_arg(),
-                        w.into_tensor_arg(),
-                        out.clone().into_tensor_arg(),
-                        n,
-                        k,
-                        m,
-                        wshift as i32,
-                        shift as i32,
-                        -bound,
-                        bound,
-                        wr,
-                        wc,
-                        ks,
-                    );
-                }
-                return out;
-            }
-            let (tr, tc) = tile_shape(n, m);
-            let cube_count = CubeCount::Static(n.div_ceil(16 * tr) as u32, m.div_ceil(16 * tc) as u32, 1);
-            let address = [&x, &w, &out].into_iter().map(|t| t.required_address_type()).max().unwrap_or_default();
+/// [`FusedOps::matmul_shr_clamp`] on the GPU, and with `gate` [`GpuOps::matmul_gated`]: the
+/// tensor-core kernel, the tiled one under `GMINT_MMA=0`, or the one-thread-per-output one under
+/// `GMINT_NAIVE_MATMUL`.
+fn cube_matmul(
+    x: IntTensor<CubeBackend>,
+    w: IntTensor<CubeBackend>,
+    wt: bool,
+    wshift: u32,
+    shift: u32,
+    bound: i32,
+    gate: Option<(IntTensor<CubeBackend>, i32)>,
+) -> IntTensor<CubeBackend> {
+    use burn_cubecl::cubecl::{CubeCount, CubeDim, calculate_cube_count_elemwise};
+    use burn_cubecl::kernel::into_contiguous;
+    use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
+
+    // the tiled kernel reads the weight through its strides, so a transpose is only a view
+    let w = if wt { CubeBackend::int_swap_dims(w, 0, 1) } else { w };
+    // without a gate the kernels are built without its reads, and `x` stands in for it
+    let gated = gate.is_some();
+    let (gate, act_max) = gate.unwrap_or_else(|| (x.clone(), 0));
+    static NAIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*NAIVE.get_or_init(|| std::env::var_os("GMINT_NAIVE_MATMUL").is_some()) {
+        let (n, k, m) = (x.meta.shape()[0], x.meta.shape()[1], w.meta.shape()[1]);
+        let out = empty_device_contiguous_dtype(x.client.clone(), x.device.clone(), Shape::from([n, m]), x.dtype);
+        let address = [&x, &w, &gate, &out].into_iter().map(|t| t.required_address_type()).max().unwrap_or_default();
+        if use_mma() {
+            let (wr, wc, ks) = mma_shape(n, m);
             unsafe {
-                kernel::matmul_tiled::launch_unchecked(
+                kernel::matmul_mma::launch_unchecked(
                     &out.client,
-                    cube_count,
-                    CubeDim::new_1d(256),
+                    CubeCount::Static(n.div_ceil(16 * wr) as u32, m.div_ceil(16 * wc) as u32, 1),
+                    CubeDim::new_1d((32 * wr * wc) as u32),
                     address,
                     x.into_tensor_arg(),
                     w.into_tensor_arg(),
+                    gate.into_tensor_arg(),
                     out.clone().into_tensor_arg(),
                     n,
                     k,
@@ -2231,36 +2280,68 @@ impl FusedOps for CubeBackend {
                     shift as i32,
                     -bound,
                     bound,
-                    tr,
-                    tc,
+                    act_max,
+                    wr,
+                    wc,
+                    ks,
+                    gated,
                 );
             }
             return out;
         }
-        let (x, w) = (into_contiguous(x), into_contiguous(w));
-        let (n, k, m) = (x.meta.shape()[0], x.meta.shape()[1], w.meta.shape()[1]);
-        let out = empty_device_contiguous_dtype(x.client.clone(), x.device.clone(), Shape::from([n, m]), x.dtype);
-        let cube_dim = CubeDim::new(&x.client, n * m);
-        let cube_count = calculate_cube_count_elemwise(&x.client, n * m, cube_dim);
-        let address = [&x, &w, &out].into_iter().map(|t| t.required_address_type()).max().unwrap_or_default();
+        let (tr, tc) = tile_shape(n, m);
+        let cube_count = CubeCount::Static(n.div_ceil(16 * tr) as u32, m.div_ceil(16 * tc) as u32, 1);
         unsafe {
-            kernel::matmul_shr_clamp::launch_unchecked(
+            kernel::matmul_tiled::launch_unchecked(
                 &out.client,
                 cube_count,
-                cube_dim,
+                CubeDim::new_1d(256),
                 address,
-                x.into_linear_view(),
-                w.into_linear_view(),
-                out.clone().into_linear_view(),
+                x.into_tensor_arg(),
+                w.into_tensor_arg(),
+                gate.into_tensor_arg(),
+                out.clone().into_tensor_arg(),
+                n,
                 k,
                 m,
                 wshift as i32,
                 shift as i32,
+                -bound,
                 bound,
+                act_max,
+                tr,
+                tc,
+                gated,
             );
         }
-        out
+        return out;
     }
+    let (x, w) = (into_contiguous(x), into_contiguous(w));
+    let (n, k, m) = (x.meta.shape()[0], x.meta.shape()[1], w.meta.shape()[1]);
+    let out = empty_device_contiguous_dtype(x.client.clone(), x.device.clone(), Shape::from([n, m]), x.dtype);
+    let cube_dim = CubeDim::new(&x.client, n * m);
+    let cube_count = calculate_cube_count_elemwise(&x.client, n * m, cube_dim);
+    let address = [&x, &w, &gate, &out].into_iter().map(|t| t.required_address_type()).max().unwrap_or_default();
+    unsafe {
+        kernel::matmul_shr_clamp::launch_unchecked(
+            &out.client,
+            cube_count,
+            cube_dim,
+            address,
+            x.into_linear_view(),
+            w.into_linear_view(),
+            gate.into_linear_view(),
+            out.clone().into_linear_view(),
+            k,
+            m,
+            wshift as i32,
+            shift as i32,
+            bound,
+            act_max,
+            gated,
+        );
+    }
+    out
 }
 
 thread_local! {
@@ -2773,11 +2854,28 @@ impl GpuOps for CubeBackend {
     }
 
     fn small_matmul(m: IntTensor<Self>, n: IntTensor<Self>, mt: bool, shift: u32, bound: i32) -> IntTensor<Self> {
-        use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
         let (b, t, e) = (n.meta.shape()[0], n.meta.shape()[1], n.meta.shape()[2]);
-        let out = empty_device_contiguous_dtype(n.client.clone(), n.device.clone(), Shape::from([b, t, e]), n.dtype);
-        launch!(kernel::small_matmul::launch_unchecked, [m, n], out, t, e, mt as usize, shift as i32, bound);
+        let out = fresh!(n, [b, t, e]);
+        // built without the gate's reads; `n` stands in for it
+        let gate = n.clone();
+        launch!(kernel::small_matmul::launch_unchecked, [m, n, gate], out, t, e, mt as usize, shift as i32, bound, 0, false);
         out
+    }
+
+    fn small_matmul_gated(m: IntTensor<Self>, n: IntTensor<Self>, gate: IntTensor<Self>, mt: bool, shift: u32, bound: i32, act_max: i32) -> IntTensor<Self> {
+        let (b, t, e) = (n.meta.shape()[0], n.meta.shape()[1], n.meta.shape()[2]);
+        assert_eq!(gate.meta.shape().dims::<3>(), [b, t, e]);
+        let out = fresh!(n, [b, t, e]);
+        launch!(kernel::small_matmul::launch_unchecked, [m, n, gate], out, t, e, mt as usize, shift as i32, bound, act_max, true);
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_gated(x: IntTensor<Self>, w: IntTensor<Self>, gate: IntTensor<Self>, wt: bool, wshift: u32, shift: u32, bound: i32, act_max: i32) -> IntTensor<Self> {
+        let rows = x.meta.shape()[0];
+        let cols = if wt { w.meta.shape()[0] } else { w.meta.shape()[1] };
+        assert_eq!(gate.meta.shape().dims::<2>(), [rows, cols]);
+        cube_matmul(x, w, wt, wshift, shift, bound, Some((gate, act_max)))
     }
 
     fn chunked_xty(x: IntTensor<Self>, y: IntTensor<Self>, chunk: usize, cshift: u32) -> IntTensor<Self> {
@@ -2808,6 +2906,30 @@ pub const UNBOUNDED: i32 = 1 << 30;
 /// The fused matmul on ordinary tensors; see [`FusedOps::matmul_shr_clamp`].
 pub fn matmul(x: Tensor<2, Int>, w: Tensor<2, Int>, o: Mat) -> Tensor<2, Int> {
     Tensor::from_dispatch(Dispatch::matmul_shr_clamp(x.into_dispatch(), w.into_dispatch(), o.wt, o.wshift, o.shift, o.bound))
+}
+
+/// [`matmul`], then with a `gate` `(g, act_max)` 0 wherever `|g| >= act_max`: the error passed
+/// back through a forward clamp to +-act_max on `g`. See [`GpuOps::matmul_gated`].
+pub fn matmul_gated(x: Tensor<2, Int>, w: Tensor<2, Int>, o: Mat, gate: Option<(&Tensor<2, Int>, i32)>) -> Tensor<2, Int> {
+    match gate {
+        None => matmul(x, w, o),
+        Some((g, act_max)) if on_gpu(&x) => Tensor::from_dispatch(Dispatch::matmul_gated(
+            x.into_dispatch(),
+            w.into_dispatch(),
+            g.clone().into_dispatch(),
+            o.wt,
+            o.wshift,
+            o.shift,
+            o.bound,
+            act_max,
+        )),
+        Some((g, act_max)) => matmul(x, w, o) * unclamped(g, act_max),
+    }
+}
+
+/// 1 where `|t| < act_max`, else 0: where a clamp to +-act_max did not hold.
+fn unclamped<const D: usize>(t: &Tensor<D, Int>, act_max: i32) -> Tensor<D, Int> {
+    (t.clone().abs() * -1 + act_max).clamp(0, 1)
 }
 
 /// See [`FusedOps::rows_by_value`].
@@ -2937,6 +3059,23 @@ pub fn small_matmul(m: Tensor<3, Int>, n: Tensor<3, Int>, mt: bool, shift: u32, 
     }
     let m = if mt { m.transpose() } else { m };
     crate::fixed::shr_floor(m.matmul(n), shift).clamp(-bound, bound)
+}
+
+/// [`small_matmul`], then with a `gate` as in [`matmul_gated`].
+pub fn small_matmul_gated(m: Tensor<3, Int>, n: Tensor<3, Int>, mt: bool, shift: u32, bound: i32, gate: Option<(&Tensor<3, Int>, i32)>) -> Tensor<3, Int> {
+    match gate {
+        None => small_matmul(m, n, mt, shift, bound),
+        Some((g, act_max)) if on_gpu(&n) => Tensor::from_dispatch(Dispatch::small_matmul_gated(
+            m.into_dispatch(),
+            n.into_dispatch(),
+            g.clone().into_dispatch(),
+            mt,
+            shift,
+            bound,
+            act_max,
+        )),
+        Some((g, act_max)) => small_matmul(m, n, mt, shift, bound) * unclamped(g, act_max),
+    }
 }
 
 /// `x^T @ y` summed over rows in chunks of `chunk`, then averaged over the chunks, so the result
@@ -3137,7 +3276,7 @@ mod timing {
     fn step_timings() {
         use crate::fixed::{Arch, Config, Head, Predictor};
         let device = crate::fixed::test_device();
-        let cfg = Config { arch: Arch::Attn, ctx: 8, emb: 32, hid: 256, batch: 512, lr: 14, rule: crate::optim::Rule::Auto, head: Head::Tree, matcher: true, comps: 8, replicas: 8, short: 2, adapt: 0, warm: 0, norm: false, seed: 7 };
+        let cfg = Config { arch: Arch::Attn, ctx: 8, emb: 32, hid: 256, batch: 512, lr: 14, rule: crate::optim::Rule::Auto, head: Head::Tree, matcher: true, comps: 8, replicas: 8, short: 2, adapt: 0, warm: 0, norm: false, mask: true, seed: 7 };
         let mut model = crate::mix::Mix::new(cfg, &device);
         let ctx = ints(&device, [512, 8], 127, 1).abs();
         let guess = Tensor::<2, Int>::cat(vec![ints(&device, [512, 1], 127, 2).abs(), ints(&device, [512, 1], 1, 3).abs()], 1);
